@@ -419,7 +419,8 @@ function ModelPage({evaluation,scoringForm,setScoringForm,runScore,singleScore}:
 function csvCell(value: unknown): string {
   const raw = Array.isArray(value) ? value.join("; ") : String(value ?? "");
   // Prevent formula execution when exported CSV is opened in spreadsheet software.
-  const safe = /^[\\u0000-\\u0020]*[=+\\-@]/.test(raw) ? `'${raw}` : raw;
+  const formulaPrefix = ["=", "+", "-", "@"].includes(raw.trimStart().charAt(0));
+  const safe = formulaPrefix ? `'${raw}` : raw;
   return `"${safe.replaceAll('"', '""')}"`;
 }
 function downloadRows(rows:Record<string,unknown>[]){
