@@ -4,6 +4,7 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from backend.app.models import RiskPolicyRecord, TransactionRecord
+from backend.app.tenancy import DEFAULT_TENANT_ID, ensure_default_tenant
 from backend.app.risk_scoring import ScoreRequest, score_features
 
 
@@ -24,14 +25,28 @@ DEMO_ROWS = [
 
 
 def seed_demo_data(db: Session) -> None:
-    if db.scalar(select(RiskPolicyRecord).where(RiskPolicyRecord.id == 1)) is None:
-        db.add(RiskPolicyRecord(id=1, low_max=29, review_max=64))
-    if db.scalar(select(TransactionRecord.id).limit(1)) is not None:
+    ensure_default_tenant(db)
+    policy = db.scalar(
+        select(RiskPolicyRecord).where(RiskPolicyRecord.tenant_id == DEFAULT_TENANT_ID)
+    )
+    if policy is None:
+        policy = RiskPolicyRecord(
+            tenant_id=DEFAULT_TENANT_ID,
+            low_max=29,
+            review_max=64,
+        )
+        db.add(policy)
+        db.flush()
+
+    existing_transaction = db.scalar(
+        select(TransactionRecord.id)
+        .where(TransactionRecord.tenant_id == DEFAULT_TENANT_ID)
+        .limit(1)
+    )
+    if existing_transaction is not None:
         db.commit()
         return
 
-    policy = db.get(RiskPolicyRecord, 1)
-    low_max, review_max = (policy.low_max, policy.review_max) if policy else (29, 64)
     for identifier, amount, country, velocity, age, hour, cross_border, decision, created in DEMO_ROWS:
         payload = ScoreRequest(
             amount=amount,
@@ -41,9 +56,10 @@ def seed_demo_data(db: Session) -> None:
             hour_of_day=hour,
             cross_border=cross_border,
         )
-        scored = score_features(payload, low_max, review_max)
+        scored = score_features(payload, policy.low_max, policy.review_max)
         db.add(TransactionRecord(
             id=identifier,
+            tenant_id=DEFAULT_TENANT_ID,
             amount=amount,
             currency="USD",
             country=country,
