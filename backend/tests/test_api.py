@@ -195,14 +195,15 @@ def test_protected_endpoint_rejects_anonymous_client(client):
     assert response.status_code == 401
 
 
-def test_registration_only_creates_viewers(client):
+def test_registration_creates_an_isolated_workspace_admin(client):
     response = client.post(
         "/api/auth/register",
         json={"email": "new.viewer@example.com", "password": "new-viewer-password-123!"},
     )
     assert response.status_code == 201
-    assert response.json()["role"] == "viewer"
+    assert response.json()["role"] == "admin"
     assert "password_hash" not in response.json()
+    assert response.json()["tenant_name"] == "new.viewer's workspace"
     duplicate = client.post(
         "/api/auth/register",
         json={"email": "NEW.VIEWER@example.com", "password": "new-viewer-password-123!"},
@@ -308,13 +309,16 @@ def test_bootstrap_admin_does_not_promote_existing_viewer(monkeypatch):
     monkeypatch.setenv("RISKLENS_BOOTSTRAP_ADMIN_EMAIL", "existing@example.com")
     monkeypatch.setenv("RISKLENS_BOOTSTRAP_ADMIN_PASSWORD", "bootstrap-password-123!")
     with TestingSessionLocal() as db:
+        db.add(TenantRecord(id=DEFAULT_TENANT_ID, name=DEFAULT_TENANT_NAME))
+        db.flush()
         db.add(UserRecord(
+            tenant_id=DEFAULT_TENANT_ID,
             id="existing-viewer", email="existing@example.com",
             password_hash=hash_password("viewer-password-123!"),
             role="viewer", is_active=True,
         ))
         db.commit()
-        with pytest.raises(RuntimeError, match="roles are never auto-promoted"):
+        with pytest.raises(RuntimeError, match="Bootstrap email is already used"):
             bootstrap_admin(db)
         assert db.get(UserRecord, "existing-viewer").role == "viewer"
     Base.metadata.drop_all(bind=engine)
