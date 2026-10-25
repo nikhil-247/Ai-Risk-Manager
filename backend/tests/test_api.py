@@ -34,6 +34,10 @@ def client():
                 id="test-viewer-id", email="viewer@example.com",
                 password_hash=hash_password("test-viewer-password-123!"), role="viewer", is_active=True,
             ),
+            UserRecord(
+                id="test-disabled-id", email="disabled@example.com",
+                password_hash=hash_password("disabled-user-password-123!"), role="analyst", is_active=False,
+            ),
         ])
         db.commit()
 
@@ -165,6 +169,7 @@ def test_auth_login_and_me(client):
     assert response.status_code == 200
     payload = response.json()
     assert payload["token_type"] == "bearer"
+    assert response.headers["cache-control"] == "no-store"
     assert payload["user"]["role"] == "admin"
     client.headers.update({"Authorization": f"Bearer {payload['access_token']}"})
     me = client.get("/api/auth/me")
@@ -242,3 +247,39 @@ def test_admin_can_create_role_scoped_user(client):
     )
     assert response.status_code == 201
     assert response.json()["role"] == "analyst"
+    assert "password_hash" not in response.json()
+    audit = client.get("/api/audit").json()
+    assert audit["total"] == 1
+    assert audit["items"][0]["event_type"] == "user_created"
+    assert audit["items"][0]["actor"] == "admin@example.com"
+    assert audit["items"][0]["details"]["email"] == "new.analyst@example.com"
+
+
+def test_login_rejects_wrong_password(client):
+    client.headers.pop("Authorization", None)
+    response = client.post(
+        "/api/auth/login",
+        data={"username": "admin@example.com", "password": "wrong-password-value"},
+    )
+    assert response.status_code == 401
+    assert response.headers["cache-control"] == "no-store"
+
+
+def test_invalid_and_inactive_tokens_are_rejected(client):
+    client.headers.update({"Authorization": "Bearer definitely.not-a-valid-token"})
+    invalid = client.get("/api/summary")
+    assert invalid.status_code == 401
+
+    disabled_token = create_access_token("test-disabled-id")
+    client.headers.update({"Authorization": f"Bearer {disabled_token}"})
+    disabled = client.get("/api/summary")
+    assert disabled.status_code == 401
+
+
+def test_batch_upload_enforces_size_limit(client):
+    oversized = b"amount\\n1\\n" + (b" " * 2_000_001)
+    response = client.post(
+        "/api/transactions/batch",
+        files={"file": ("large.csv", oversized, "text/csv")},
+    )
+    assert response.status_code == 413
