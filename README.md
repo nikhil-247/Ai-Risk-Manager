@@ -137,7 +137,14 @@ docker compose up --build
 - Swagger docs: http://localhost:8000/docs
 - Health check: http://localhost:8000/api/health
 
-Compose stores database data in a named volume. For local demo sign-in, add `RISKLENS_JWT_SECRET`, `RISKLENS_BOOTSTRAP_ADMIN_EMAIL`, and `RISKLENS_BOOTSTRAP_ADMIN_PASSWORD` to a local ignored `.env` file before starting Compose. The bootstrap password must contain at least 12 characters. Without bootstrap credentials, users can register as read-only viewers; an admin can create analyst/admin accounts through `POST /api/auth/admin/users`. Use a long random JWT secret and strong PostgreSQL credentials outside local development. This MVP is not hardened for public production deployment.
+Compose now refuses to start unless explicit database and JWT secrets are set.
+
+1. Copy `.env.example` to `.env`.
+2. Fill `POSTGRES_PASSWORD` and `RISKLENS_JWT_SECRET` with different, long URL-safe random values. You can generate one with `python -c "import secrets; print(secrets.token_urlsafe(48))"`.
+3. Set `RISKLENS_BOOTSTRAP_ADMIN_EMAIL` and a unique `RISKLENS_BOOTSTRAP_ADMIN_PASSWORD` of at least 12 characters.
+4. Run `docker compose up --build`.
+
+The bootstrap admin is created only when that email has no account. If the address is already registered as a viewer or analyst, startup stops with an explicit error rather than silently promoting or reusing it. Without bootstrap credentials, users can register as read-only viewers; an admin can create analyst/admin accounts through `POST /api/auth/admin/users`. For deployment, set `RISKLENS_ENV=production`, use HTTPS, and set `RISKLENS_CORS_ORIGINS` to the exact comma-separated frontend origins. This MVP still needs a deployment-specific security review before handling real customer data.
 
 ## Public benchmark setup
 
@@ -195,9 +202,12 @@ Cost values are illustrative user-provided units until a merchant supplies appro
 
 ## Security and data honesty
 
-- API authentication uses Argon2 password hashes and expiring HS256 bearer tokens. Set a strong, random `RISKLENS_JWT_SECRET`; the built-in fallback is for local development only.
+- API authentication uses Argon2 password hashes and expiring HS256 bearer tokens. `RISKLENS_ENV=production` refuses missing or built-in development JWT secrets. Docker Compose also requires explicit PostgreSQL and JWT secrets.
 - Public registration creates viewer accounts only. Configure both `RISKLENS_BOOTSTRAP_ADMIN_EMAIL` and `RISKLENS_BOOTSTRAP_ADMIN_PASSWORD` to seed the first admin, or leave both unset. Admins can provision analyst/viewer/admin accounts through the protected admin endpoint.
-- Dashboard data endpoints require authentication. Analysts and admins can submit review decisions and read audit logs; only admins can change policies or provision users. These are API-enforced permissions, not just hidden UI controls.
+- Dashboard data endpoints require authentication. Analysts and admins can submit review decisions and read audit logs; only admins can change policies or provision users. Account creation is written to the audit trail, and reviewer identity comes from the authenticated account. These are API-enforced permissions, not just hidden UI controls.
+- CSV batch uploads are read with a 2 MB bound before parsing, and exported cell values are neutralized against spreadsheet-formula injection.
+- Login responses are marked `Cache-Control: no-store`; the frontend clears local session state when an API request returns an unauthorized response.
+- Set `RISKLENS_CORS_ORIGINS` to exact trusted origins when hosting the frontend outside localhost. CORS is not a replacement for authentication or network-level controls.
 - Tenant separation is not implemented yet. Do not expose this deployment publicly with real multi-customer data.
 - Use synthetic or approved anonymized data only.
 - Local Docker default credentials are not production secrets.
