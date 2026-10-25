@@ -3,7 +3,7 @@ import React from "react";
 import {
   Activity, AlertOctagon, ArrowUpRight, Bell, BrainCircuit, Check, ChevronDown,
   CircleHelp, Clock3, Download, FileSearch, Filter, Gauge, LayoutDashboard, LogOut,
-  ListFilter, LockKeyhole, Menu, MoreHorizontal, Search, ShieldAlert, ShieldCheck,
+  ListFilter, LockKeyhole, Menu, Search, ShieldAlert, ShieldCheck,
   SlidersHorizontal, Upload, X,
 } from "lucide-react";
 import {
