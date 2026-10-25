@@ -344,3 +344,45 @@ def test_production_requires_explicit_non_development_jwt_secret():
     )
     assert unsafe_secret.returncode != 0
     assert "cannot be used in production" in unsafe_secret.stderr
+
+
+def test_registered_workspace_cannot_read_or_change_default_tenant_data(client):
+    registered = client.post(
+        "/api/auth/register",
+        json={"email": "fresh.workspace@example.com", "password": "fresh-workspace-password-123!"},
+    )
+    assert registered.status_code == 201
+    assert registered.json()["role"] == "admin"
+
+    default_headers = dict(client.headers)
+    login = client.post(
+        "/api/auth/login",
+        data={"username": "fresh.workspace@example.com", "password": "fresh-workspace-password-123!"},
+    )
+    assert login.status_code == 200
+    client.headers.update({"Authorization": "Bearer " + login.json()["access_token"]})
+
+    summary = client.get("/api/summary")
+    assert summary.status_code == 200
+    assert summary.json()["total_transactions"] == 0
+    assert client.get("/api/transactions").json()["total"] == 0
+    assert client.get("/api/transactions/txn_1001").status_code == 404
+
+    policy = client.get("/api/policies")
+    assert policy.status_code == 200
+    assert (policy.json()["low_max"], policy.json()["review_max"]) == (29, 64)
+    updated = client.put("/api/policies", json={"low_max": 10, "review_max": 40})
+    assert updated.status_code == 200
+    assert client.get("/api/policies").json()["low_max"] == 10
+
+    audit = client.get("/api/audit")
+    assert audit.status_code == 200
+    assert audit.json()["total"] == 2
+    assert {item["event_type"] for item in audit.json()["items"]} == {"user_created", "policy_updated"}
+
+    client.headers.clear()
+    client.headers.update(default_headers)
+    default_policy = client.get("/api/policies")
+    assert default_policy.status_code == 200
+    assert (default_policy.json()["low_max"], default_policy.json()["review_max"]) == (29, 64)
+    assert client.get("/api/transactions/txn_1001").status_code == 200
