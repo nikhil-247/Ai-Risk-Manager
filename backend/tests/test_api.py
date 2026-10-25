@@ -347,6 +347,16 @@ def test_production_requires_explicit_non_development_jwt_secret():
 
 
 def test_registered_workspace_cannot_read_or_change_default_tenant_data(client):
+    provisioned = client.post(
+        "/api/auth/admin/users",
+        json={
+            "email": "default.member@example.com",
+            "password": "default-member-password-123!",
+            "role": "viewer",
+        },
+    )
+    assert provisioned.status_code == 201
+
     registered = client.post(
         "/api/auth/register",
         json={"email": "fresh.workspace@example.com", "password": "fresh-workspace-password-123!"},
@@ -367,6 +377,11 @@ def test_registered_workspace_cannot_read_or_change_default_tenant_data(client):
     assert summary.json()["total_transactions"] == 0
     assert client.get("/api/transactions").json()["total"] == 0
     assert client.get("/api/transactions/txn_1001").status_code == 404
+    review_from_other_tenant = client.post(
+        "/api/reviews/txn_1001",
+        json={"decision": "confirmed_fraud", "note": "cross-tenant attempt"},
+    )
+    assert review_from_other_tenant.status_code == 404
 
     policy = client.get("/api/policies")
     assert policy.status_code == 200
@@ -386,3 +401,7 @@ def test_registered_workspace_cannot_read_or_change_default_tenant_data(client):
     assert default_policy.status_code == 200
     assert (default_policy.json()["low_max"], default_policy.json()["review_max"]) == (29, 64)
     assert client.get("/api/transactions/txn_1001").status_code == 200
+    default_audit = client.get("/api/audit")
+    assert default_audit.status_code == 200
+    assert default_audit.json()["total"] == 1
+    assert default_audit.json()["items"][0]["details"]["email"] == "default.member@example.com"
