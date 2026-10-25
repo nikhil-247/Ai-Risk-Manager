@@ -18,6 +18,7 @@ RiskLens AI is a full-stack transaction-risk decision-support application with a
 - Audit trail for review actions and policy updates.
 - FastAPI OpenAPI / Swagger documentation.
 - Argon2 password hashing, expiring JWT access tokens, and server-enforced admin/analyst/viewer roles.
+- Workspace (tenant) isolation for transactions, risk policies, and audit events, with a tenant ID derived from the authenticated user.
 - SQLite for local development; PostgreSQL in Docker Compose.
 - GitHub Actions jobs for backend/ML tests and frontend production compilation.
 
@@ -144,7 +145,7 @@ Compose now refuses to start unless explicit database and JWT secrets are set.
 3. Set `RISKLENS_BOOTSTRAP_ADMIN_EMAIL` and a unique `RISKLENS_BOOTSTRAP_ADMIN_PASSWORD` of at least 12 characters.
 4. Run `docker compose up --build`.
 
-The bootstrap admin is created only when that email has no account. If the address is already registered as a viewer or analyst, startup stops with an explicit error rather than silently promoting or reusing it. Without bootstrap credentials, users can register as read-only viewers; an admin can create analyst/admin accounts through `POST /api/auth/admin/users`. For deployment, set `RISKLENS_ENV=production`, use HTTPS, and set `RISKLENS_CORS_ORIGINS` to the exact comma-separated frontend origins. This MVP still needs a deployment-specific security review before handling real customer data.
+The bootstrap admin is placed in the default `Northstar Payments` demo workspace, which contains the seeded sample transactions. The bootstrap email must not already belong to a different workspace or a non-admin/disabled account; the application never silently promotes an existing user. Public registration creates a new isolated workspace and makes its first member that workspace's admin. Admins can provision analyst/admin/viewer accounts inside their own workspace through `POST /api/auth/admin/users`. For deployment, set `RISKLENS_ENV=production`, use HTTPS, and set `RISKLENS_CORS_ORIGINS` to the exact comma-separated frontend origins. This MVP still needs a deployment-specific security review before handling real customer data.
 
 ## Public benchmark setup
 
@@ -186,7 +187,7 @@ Cost values are illustrative user-provided units until a merchant supplies appro
 | Method | Endpoint | Function |
 |---|---|---|
 | GET | `/api/health` | API and database readiness |
-| POST | `/api/auth/register` | Register a read-only viewer account |
+| POST | `/api/auth/register` | Create a new isolated workspace and its first admin |
 | POST | `/api/auth/login` | Get an expiring bearer access token (OAuth2 form: username=email) |
 | GET | `/api/auth/me` | Current user and role |
 | POST | `/api/auth/admin/users` | Admin-only account provisioning with explicit role |
@@ -203,12 +204,12 @@ Cost values are illustrative user-provided units until a merchant supplies appro
 ## Security and data honesty
 
 - API authentication uses Argon2 password hashes and expiring HS256 bearer tokens. `RISKLENS_ENV=production` refuses missing or built-in development JWT secrets. Docker Compose also requires explicit PostgreSQL and JWT secrets.
-- Public registration creates viewer accounts only. Configure both `RISKLENS_BOOTSTRAP_ADMIN_EMAIL` and `RISKLENS_BOOTSTRAP_ADMIN_PASSWORD` to seed the first admin, or leave both unset. Admins can provision analyst/viewer/admin accounts through the protected admin endpoint.
+- Public registration creates a new isolated workspace with the registering user as its admin. The configured bootstrap admin belongs to the default demo workspace. Admins can provision analyst/viewer/admin accounts within their own workspace through the protected admin endpoint.
 - Dashboard data endpoints require authentication. Analysts and admins can submit review decisions and read audit logs; only admins can change policies or provision users. Account creation is written to the audit trail, and reviewer identity comes from the authenticated account. These are API-enforced permissions, not just hidden UI controls.
 - CSV batch uploads are read with a 2 MB bound before parsing, and exported cell values are neutralized against spreadsheet-formula injection.
 - Login responses are marked `Cache-Control: no-store`; the frontend clears local session state when an API request returns an unauthorized response.
 - Set `RISKLENS_CORS_ORIGINS` to exact trusted origins when hosting the frontend outside localhost. CORS is not a replacement for authentication or network-level controls.
-- Tenant separation is not implemented yet. Do not expose this deployment publicly with real multi-customer data.
+- Tenant IDs are attached to users, transactions, risk policies, and audit events. The API derives the tenant scope from the signed-in user, and the migration assigns pre-existing rows to the default demo workspace. Regression tests cover attempts to access another tenant's transaction and policy data.
 - Use synthetic or approved anonymized data only.
 - Local Docker default credentials are not production secrets.
 - Audit events persist, but are not cryptographically tamper-evident.
@@ -219,7 +220,7 @@ Cost values are illustrative user-provided units until a merchant supplies appro
 ## Roadmap
 
 1. Alembic migrations now manage schema changes; keep migrations versioned and reviewed.
-2. Add tenant boundaries and tenant-scoped queries/tests.
+2. Tenant isolation and cross-tenant regression tests are implemented; add invitations, tenant administration, and account lifecycle controls next.
 3. Validate a merchant-like model feature schema and integrate inference only after testing.
 4. Add model versioning, threshold approvals, drift detection and alerting.
 5. Deploy with secrets management, observability, rate limits and security review.
