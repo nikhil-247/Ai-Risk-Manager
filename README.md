@@ -75,6 +75,7 @@ py -3.11 -m venv .venv
 .\.venv\Scripts\Activate.ps1
 python -m pip install --upgrade pip
 pip install -r backend/requirements.txt
+alembic -c backend/alembic.ini upgrade head
 uvicorn backend.app.main:app --reload --port 8000
 ```
 
@@ -192,7 +193,7 @@ Cost values are illustrative user-provided units until a merchant supplies appro
 
 ## Roadmap
 
-1. Add Alembic migrations and stronger database lifecycle handling.
+1. Alembic migrations now manage schema changes; keep migrations versioned and reviewed.
 2. Add real authentication, RBAC and tenant boundaries.
 3. Validate a merchant-like model feature schema and integrate inference only after testing.
 4. Add model versioning, threshold approvals, drift detection and alerting.

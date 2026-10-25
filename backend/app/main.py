@@ -16,7 +16,7 @@ from pydantic import BaseModel, Field, ValidationError, field_validator
 from sqlalchemy import desc, func, select
 from sqlalchemy.orm import Session
 
-from backend.app.database import get_db, init_db
+from backend.app.database import get_db
 from backend.app.models import AuditEvent, RiskPolicyRecord, TransactionRecord
 from backend.app.risk_scoring import ScoreRequest, score_features
 from backend.app.seed import seed_demo_data
@@ -24,7 +24,6 @@ from backend.app.seed import seed_demo_data
 
 @asynccontextmanager
 async def lifespan(_: FastAPI):
-    init_db()
     from backend.app.database import SessionLocal
     with SessionLocal() as db:
         seed_demo_data(db)
