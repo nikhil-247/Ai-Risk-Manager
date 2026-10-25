@@ -29,6 +29,8 @@ type Evaluation = {
   confusion_matrix: { tp: number; fp: number; fn: number; tn: number }; warning: string;
 };
 type Page = "overview" | "transactions" | "investigations" | "model" | "policies" | "audit";
+type AuthUser = { id: number; email: string; role: "admin" | "analyst" | "viewer"; is_active: boolean; created_at: string | null };
+type LoginResponse = { access_token: string; token_type: string; expires_in: number; user: AuthUser };
 
 const money = (amount: number) => new Intl.NumberFormat("en-US", {
   style: "currency", currency: "USD", maximumFractionDigits: 2,
@@ -38,7 +40,10 @@ const dateTime = (value: string) => new Date(value).toLocaleString([], {
 });
 
 async function api<T>(path: string, init?: RequestInit): Promise<T> {
-  const response = await fetch(path, init);
+  const headers = new Headers(init?.headers);
+  const token = window.localStorage.getItem("risklens_access_token");
+  if (token) headers.set("Authorization", `Bearer ${token}`);
+  const response = await fetch(path, { ...init, headers });
   if (!response.ok) {
     const body = await response.json().catch(() => null);
     throw new Error(body?.detail || `Request failed (${response.status})`);
@@ -59,6 +64,41 @@ const navGroups: { title: string; items: { id: Page; label: string; icon: typeof
   ]},
 ];
 
+
+function LoginScreen({ onLogin }: { onLogin: (email: string, password: string) => Promise<void> }) {
+  const [email, setEmail] = useState("");
+  const [password, setPassword] = useState("");
+  const [error, setError] = useState("");
+  const [busy, setBusy] = useState(false);
+
+  async function submit(event: React.FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    setError("");
+    setBusy(true);
+    try {
+      await onLogin(email, password);
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : "Sign-in failed");
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  return <main className="auth-shell">
+    <form className="auth-card" onSubmit={submit}>
+      <div className="auth-brand"><div className="auth-brand-mark"><ShieldCheck size={23}/></div><div><strong>risklens<span> AI</span></strong><small>RISK INTELLIGENCE</small></div></div>
+      <p className="auth-eyebrow">SECURE WORKSPACE</p>
+      <h1>Sign in to RiskLens</h1>
+      <p className="auth-copy">Use your workspace account to review transactions and manage risk controls.</p>
+      <label className="auth-field">Work email<input autoComplete="username" type="email" required value={email} onChange={(event) => setEmail(event.target.value)} placeholder="you@company.com"/></label>
+      <label className="auth-field">Password<input autoComplete="current-password" type="password" required value={password} onChange={(event) => setPassword(event.target.value)} placeholder="Your password"/></label>
+      {error && <p className="auth-error" role="alert">{error}</p>}
+      <button type="submit" className="btn btn-primary auth-submit" disabled={busy}>{busy ? "Signing in…" : "Sign in"} <ArrowUpRight size={16}/></button>
+      <p className="auth-footnote">Accounts are provisioned by a workspace administrator. Public self-registration is disabled.</p>
+    </form>
+  </main>;
+}
+
 function RiskPill({ risk }: { risk: string }) {
   return <span className={`risk-pill risk-${risk}`}><span />{risk}</span>;
 }
@@ -73,6 +113,8 @@ function ScoreRing({ score }: { score: number }) {
 }
 
 export default function App() {
+  const [authUser, setAuthUser] = useState<AuthUser | null>(null);
+  const [authLoading, setAuthLoading] = useState(true);
   const [page, setPage] = useState<Page>("overview");
   const [transactions, setTransactions] = useState<Transaction[]>([]);
   const [summary, setSummary] = useState<Summary | null>(null);
@@ -121,7 +163,20 @@ export default function App() {
     }
   }
 
-  useEffect(() => { void refresh(); }, []);
+  useEffect(() => {
+    let active = true;
+    const token = window.localStorage.getItem("risklens_access_token");
+    if (!token) {
+      setAuthLoading(false);
+      return () => { active = false; };
+    }
+    api<AuthUser>("/api/auth/me")
+      .then((user) => { if (active) setAuthUser(user); })
+      .catch(() => { window.localStorage.removeItem("risklens_access_token"); })
+      .finally(() => { if (active) setAuthLoading(false); });
+    return () => { active = false; };
+  }, []);
+  useEffect(() => { if (authUser) void refresh(); }, [authUser]);
   useEffect(() => {
     if (!toast) return;
     const timer = window.setTimeout(() => setToast(""), 3200);
@@ -217,6 +272,31 @@ export default function App() {
     model: "Model evaluation", policies: "Risk policies", audit: "Audit trail",
   } satisfies Record<Page, string>)[page];
 
+  async function signIn(email: string, password: string) {
+    const response = await fetch("/api/auth/login", {
+      method: "POST",
+      headers: { "Content-Type": "application/x-www-form-urlencoded" },
+      body: new URLSearchParams({ username: email, password }),
+    });
+    const payload = await response.json().catch(() => null) as LoginResponse | { detail?: string } | null;
+    if (!response.ok || !payload || !("access_token" in payload)) {
+      throw new Error(payload && "detail" in payload ? payload.detail || "Could not sign in" : "Could not sign in");
+    }
+    window.localStorage.setItem("risklens_access_token", payload.access_token);
+    setAuthUser(payload.user);
+  }
+
+  function signOut() {
+    window.localStorage.removeItem("risklens_access_token");
+    setAuthUser(null);
+    setSelected(null);
+    setSummary(null);
+    setTransactions([]);
+  }
+
+  if (authLoading) return <main className="auth-shell"><div className="auth-loading">Loading your secure workspace…</div></main>;
+  if (!authUser) return <LoginScreen onLogin={signIn} />;
+
   return <div className="app-shell">
     <aside className={`sidebar ${mobileNav ? "sidebar-open" : ""}`}>
       <div className="brand">
@@ -236,7 +316,7 @@ export default function App() {
       <div className="sidebar-bottom">
         <div className="model-status"><span className="pulse-dot"/><div><strong>Demo rules engine</strong><small>API connected when online</small></div></div>
         <button className="nav-item" onClick={() => setToast("Demo environment: no real payments are connected.")}><CircleHelp size={17}/><span>Help & documentation</span></button>
-        <div className="profile-row"><div className="profile-avatar">NK</div><div><strong>Demo Analyst</strong><small>Risk operations</small></div><MoreHorizontal size={18}/></div>
+        <div className="profile-row"><div className="profile-avatar">{authUser.email.slice(0, 2).toUpperCase()}</div><div><strong>{authUser.email}</strong><small>{authUser.role} role</small></div><button className="profile-signout" onClick={signOut} aria-label="Sign out" title="Sign out"><X size={16}/></button></div>
       </div>
     </aside>
 
@@ -266,7 +346,7 @@ export default function App() {
             </section>}
 
             {page === "model" && evaluation && <ModelPage evaluation={evaluation} scoringForm={scoringForm} setScoringForm={setScoringForm} runScore={runScore} singleScore={singleScore}/>}
-            {page === "policies" && <section className="panel policy-panel"><div className="panel-heading"><div><h2>Risk routing thresholds</h2><p>Scores are demo rule points, not fraud probabilities.</p></div><span className="tag tag-amber">DEMO CONFIGURATION</span></div><div className="policy-scale"><div className="scale-segment safe-segment">LOW <span>0–{policyLow}</span></div><div className="scale-segment medium-segment">REVIEW <span>{policyLow + 1}–{policyReview}</span></div><div className="scale-segment high-segment">HIGH <span>{policyReview + 1}–100</span></div></div><div className="policy-controls"><label><span><strong>Low risk maximum</strong><small>Scores up to this value stay in the low-risk band.</small></span><input type="number" min={0} max={98} value={policyLow} onChange={(e) => setPolicyLow(Number(e.target.value))}/></label><label><span><strong>Manual review maximum</strong><small>Higher scores route to priority review.</small></span><input type="number" min={1} max={100} value={policyReview} onChange={(e) => setPolicyReview(Number(e.target.value))}/></label></div>{policyReview <= policyLow && <div className="inline-error">Review threshold must be greater than low-risk threshold.</div>}<div className="policy-footer"><p><LockKeyhole size={14}/> Changes are kept in memory for this demo session and reset on restart.</p><button disabled={policyReview <= policyLow || policyLow < 0 || policyReview > 100} className="btn btn-primary" onClick={() => void savePolicy()}>Save policy <Check size={15}/></button></div></section>}
+            {page === "policies" && <section className="panel policy-panel"><div className="panel-heading"><div><h2>Risk routing thresholds</h2><p>Scores are demo rule points, not fraud probabilities.</p></div><span className="tag tag-amber">DEMO CONFIGURATION</span></div><div className="policy-scale"><div className="scale-segment safe-segment">LOW <span>0–{policyLow}</span></div><div className="scale-segment medium-segment">REVIEW <span>{policyLow + 1}–{policyReview}</span></div><div className="scale-segment high-segment">HIGH <span>{policyReview + 1}–100</span></div></div><div className="policy-controls"><label><span><strong>Low risk maximum</strong><small>Scores up to this value stay in the low-risk band.</small></span><input type="number" min={0} max={98} value={policyLow} onChange={(e) => setPolicyLow(Number(e.target.value))}/></label><label><span><strong>Manual review maximum</strong><small>Higher scores route to priority review.</small></span><input type="number" min={1} max={100} value={policyReview} onChange={(e) => setPolicyReview(Number(e.target.value))}/></label></div>{policyReview <= policyLow && <div className="inline-error">Review threshold must be greater than low-risk threshold.</div>}<div className="policy-footer"><p><LockKeyhole size={14}/> Changes are kept in memory for this demo session and reset on restart.</p><button disabled={authUser.role !== "admin" || policyReview <= policyLow || policyLow < 0 || policyReview > 100} className="btn btn-primary" onClick={() => void savePolicy()} title={authUser.role !== "admin" ? "Only admins can change risk policies" : undefined}>Save policy <Check size={15}/></button></div></section>}
 
             {page === "audit" && <section className="panel"><div className="panel-heading"><div><h2>Recent audit events</h2><p>Review and policy events recorded by the API during this process.</p></div><button className="btn btn-secondary btn-small" onClick={() => void loadAudit()}><Activity size={14}/> Refresh log</button></div>{auditRows.length === 0 ? <div className="empty-state">No events yet. Review a transaction or update a risk policy to create an audit event.</div> : <div className="audit-list">{auditRows.map((row) => <div className="audit-item" key={String(row.id)}><div className="audit-icon"><ShieldCheck size={16}/></div><div><strong>{String(row.event_type).replaceAll("_", " ")}</strong><span>Actor: {String(row.actor)} · Transaction: {String(row.transaction_id)}</span><small>{dateTime(String(row.timestamp))}</small><code>{JSON.stringify(row.details)}</code></div></div>)}</div>}</section>}
           </>}
@@ -274,7 +354,7 @@ export default function App() {
       </div>
     </main>
 
-    {selected && <div className="drawer-backdrop" onClick={() => setSelected(null)} role="presentation"><aside className="detail-drawer" onClick={(e) => e.stopPropagation()}><div className="drawer-header"><div><span className="eyebrow">TRANSACTION INSPECTOR</span><h2>{selected.id}</h2></div><button className="icon-button" onClick={() => setSelected(null)} aria-label="Close transaction details"><X size={18}/></button></div><div className="drawer-body"><div className="drawer-score"><ScoreRing score={selected.risk_score}/><div><RiskPill risk={selected.risk_category}/><h3>{money(selected.amount)}</h3><span className="muted">{selected.country} · {selected.currency}</span><p className="muted">{dateTime(selected.created_at)}</p></div></div><div className="drawer-section"><div className="section-title">RECOMMENDED ROUTING</div><div className="recommendation"><ShieldAlert size={18}/><div><strong>{selected.recommended_action.replaceAll("_", " ")}</strong><p>Recommendation only. No payment action is connected.</p></div></div></div><div className="drawer-section"><div className="section-title">WHY WAS THIS FLAGGED?</div><div className="reason-list">{selected.reasons.map((reason) => <div key={reason}><span><Check size={13}/></span>{reason}</div>)}</div></div><div className="drawer-section"><div className="section-title">SIGNALS</div><div className="signal-grid"><Signal label="Account age" value={`${selected.account_age_days} days`}/><Signal label="Txns / hour" value={String(selected.transactions_last_hour)}/><Signal label="Transaction hour" value={`${selected.hour_of_day}:00`}/><Signal label="Cross-border" value={selected.cross_border ? "Yes" : "No"}/></div></div><div className="drawer-section"><div className="section-title">REVIEW STATUS</div><StatusPill status={selected.review_status}/><textarea className="review-note" value={reviewNote} onChange={(e) => setReviewNote(e.target.value)} maxLength={1000} placeholder="Add a note to the review audit trail…"/><div className="review-actions"><button className="btn btn-danger" onClick={() => void submitReview(selected.id, "confirmed_fraud")}>Confirm fraud</button><button className="btn btn-secondary" onClick={() => void submitReview(selected.id, "legitimate")}>Mark legitimate</button></div><button className="review-reset" onClick={() => void submitReview(selected.id, "needs_review")}>Keep in review queue</button></div><div className="drawer-disclaimer"><LockKeyhole size={14}/> Demo-only scoring. Always validate signals and use human judgment.</div></div></aside></div>}
+    {selected && <div className="drawer-backdrop" onClick={() => setSelected(null)} role="presentation"><aside className="detail-drawer" onClick={(e) => e.stopPropagation()}><div className="drawer-header"><div><span className="eyebrow">TRANSACTION INSPECTOR</span><h2>{selected.id}</h2></div><button className="icon-button" onClick={() => setSelected(null)} aria-label="Close transaction details"><X size={18}/></button></div><div className="drawer-body"><div className="drawer-score"><ScoreRing score={selected.risk_score}/><div><RiskPill risk={selected.risk_category}/><h3>{money(selected.amount)}</h3><span className="muted">{selected.country} · {selected.currency}</span><p className="muted">{dateTime(selected.created_at)}</p></div></div><div className="drawer-section"><div className="section-title">RECOMMENDED ROUTING</div><div className="recommendation"><ShieldAlert size={18}/><div><strong>{selected.recommended_action.replaceAll("_", " ")}</strong><p>Recommendation only. No payment action is connected.</p></div></div></div><div className="drawer-section"><div className="section-title">WHY WAS THIS FLAGGED?</div><div className="reason-list">{selected.reasons.map((reason) => <div key={reason}><span><Check size={13}/></span>{reason}</div>)}</div></div><div className="drawer-section"><div className="section-title">SIGNALS</div><div className="signal-grid"><Signal label="Account age" value={`${selected.account_age_days} days`}/><Signal label="Txns / hour" value={String(selected.transactions_last_hour)}/><Signal label="Transaction hour" value={`${selected.hour_of_day}:00`}/><Signal label="Cross-border" value={selected.cross_border ? "Yes" : "No"}/></div></div><div className="drawer-section"><div className="section-title">REVIEW STATUS</div><StatusPill status={selected.review_status}/><textarea className="review-note" value={reviewNote} onChange={(e) => setReviewNote(e.target.value)} maxLength={1000} placeholder="Add a note to the review audit trail…"/><div className="review-actions"><button disabled={authUser.role === "viewer"} className="btn btn-danger" onClick={() => void submitReview(selected.id, "confirmed_fraud")}>Confirm fraud</button><button disabled={authUser.role === "viewer"} className="btn btn-secondary" onClick={() => void submitReview(selected.id, "legitimate")}>Mark legitimate</button></div><button disabled={authUser.role === "viewer"} className="review-reset" onClick={() => void submitReview(selected.id, "needs_review")}>Keep in review queue</button></div><div className="drawer-disclaimer"><LockKeyhole size={14}/> Demo-only scoring. Always validate signals and use human judgment.</div></div></aside></div>}
 
     {toast && <div className="toast"><Check size={16}/>{toast}<button onClick={() => setToast("")} aria-label="Dismiss notification"><X size={14}/></button></div>}
   </div>;
