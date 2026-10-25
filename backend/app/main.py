@@ -12,12 +12,23 @@ from uuid import uuid4
 
 from fastapi import Depends, FastAPI, File, HTTPException, Query, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.security import OAuth2PasswordRequestForm
 from pydantic import BaseModel, Field, ValidationError, field_validator
 from sqlalchemy import desc, func, select
 from sqlalchemy.orm import Session
 
 from backend.app.database import get_db
-from backend.app.models import AuditEvent, RiskPolicyRecord, TransactionRecord
+from backend.app.models import AuditEvent, RiskPolicyRecord, TransactionRecord, UserRecord
+from backend.app.auth import (
+    ACCESS_TOKEN_EXPIRE_MINUTES,
+    bootstrap_admin,
+    create_access_token,
+    get_current_user,
+    hash_password,
+    require_roles,
+    user_payload,
+    verify_password,
+)
 from backend.app.risk_scoring import ScoreRequest, score_features
 from backend.app.seed import seed_demo_data
 
@@ -27,6 +38,7 @@ async def lifespan(_: FastAPI):
     from backend.app.database import SessionLocal
     with SessionLocal() as db:
         seed_demo_data(db)
+        bootstrap_admin(db)
     yield
 
 
@@ -42,7 +54,7 @@ app.add_middleware(
     allow_origins=["http://localhost:5173", "http://127.0.0.1:5173"],
     allow_credentials=False,
     allow_methods=["GET", "POST", "PUT", "OPTIONS"],
-    allow_headers=["Content-Type"],
+    allow_headers=["Content-Type", "Authorization"],
 )
 
 
@@ -63,6 +75,21 @@ class PolicyUpdate(BaseModel):
         if low is not None and value <= low:
             raise ValueError("review_max must be greater than low_max")
         return value
+
+
+
+class UserCreate(BaseModel):
+    email: str = Field(min_length=5, max_length=254)
+    password: str = Field(min_length=12, max_length=128)
+    role: Literal["admin", "analyst", "viewer"] = "viewer"
+
+    @field_validator("email")
+    @classmethod
+    def normalize_and_validate_email(cls, value: str) -> str:
+        email = value.strip().lower()
+        if email.count("@") != 1 or "." not in email.rsplit("@", 1)[-1]:
+            raise ValueError("Enter a valid email address")
+        return email
 
 
 def policy_for(db: Session) -> RiskPolicyRecord:
@@ -98,8 +125,53 @@ def health(db: Session = Depends(get_db)):
     return {"status": "ok", "service": "risklens-ai-api", "version": app.version, "database": "reachable"}
 
 
+
+@app.post("/api/auth/login")
+def login(form_data: OAuth2PasswordRequestForm = Depends(), db: Session = Depends(get_db)):
+    email = form_data.username.strip().lower()
+    user = db.query(UserRecord).filter(UserRecord.email == email).first()
+    if user is None or not verify_password(form_data.password, user.password_hash) or not user.is_active:
+        raise HTTPException(
+            status_code=401,
+            detail="Incorrect email or password",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+    return {
+        "access_token": create_access_token(user.id),
+        "token_type": "bearer",
+        "expires_in": ACCESS_TOKEN_EXPIRE_MINUTES * 60,
+        "user": user_payload(user),
+    }
+
+
+@app.get("/api/auth/me")
+def auth_me(current_user: UserRecord = Depends(get_current_user)):
+    return user_payload(current_user)
+
+
+@app.post("/api/auth/users", status_code=201)
+def create_user(
+    payload: UserCreate,
+    db: Session = Depends(get_db),
+    current_user: UserRecord = Depends(require_roles("admin")),
+):
+    existing = db.query(UserRecord).filter(UserRecord.email == payload.email).first()
+    if existing is not None:
+        raise HTTPException(status_code=409, detail="An account with this email already exists")
+    user = UserRecord(
+        email=payload.email,
+        password_hash=hash_password(payload.password),
+        role=payload.role,
+        is_active=True,
+    )
+    db.add(user)
+    db.commit()
+    db.refresh(user)
+    return user_payload(user)
+
+
 @app.get("/api/summary")
-def summary(db: Session = Depends(get_db)):
+def summary(db: Session = Depends(get_db), current_user: UserRecord = Depends(get_current_user)):
     rows = list(db.scalars(select(TransactionRecord)).all())
     total = len(rows)
     return {
@@ -122,6 +194,7 @@ def transactions(
     status: Literal["all", "legitimate", "confirmed_fraud", "needs_review"] = "all",
     limit: int = Query(default=100, ge=1, le=500),
     db: Session = Depends(get_db),
+    current_user: UserRecord = Depends(get_current_user),
 ):
     query = select(TransactionRecord)
     if search:
@@ -138,7 +211,7 @@ def transactions(
 
 
 @app.get("/api/transactions/{transaction_id}")
-def transaction_detail(transaction_id: str, db: Session = Depends(get_db)):
+def transaction_detail(transaction_id: str, db: Session = Depends(get_db), current_user: UserRecord = Depends(get_current_user)):
     row = db.get(TransactionRecord, transaction_id)
     if row is None:
         raise HTTPException(status_code=404, detail="Transaction not found")
@@ -146,13 +219,13 @@ def transaction_detail(transaction_id: str, db: Session = Depends(get_db)):
 
 
 @app.post("/api/transactions/score")
-def score_one(payload: ScoreRequest, db: Session = Depends(get_db)):
+def score_one(payload: ScoreRequest, db: Session = Depends(get_db), current_user: UserRecord = Depends(get_current_user)):
     policy = policy_for(db)
     return score_features(payload, policy.low_max, policy.review_max)
 
 
 @app.post("/api/transactions/batch")
-async def score_batch(file: UploadFile = File(...), db: Session = Depends(get_db)):
+async def score_batch(file: UploadFile = File(...), db: Session = Depends(get_db), current_user: UserRecord = Depends(get_current_user)):
     if not file.filename or not file.filename.lower().endswith(".csv"):
         raise HTTPException(status_code=400, detail="Upload a .csv file")
     raw = await file.read()
@@ -187,28 +260,33 @@ async def score_batch(file: UploadFile = File(...), db: Session = Depends(get_db
 
 
 @app.post("/api/reviews/{transaction_id}")
-def review_transaction(transaction_id: str, payload: ReviewRequest, db: Session = Depends(get_db)):
+def review_transaction(
+    transaction_id: str,
+    payload: ReviewRequest,
+    db: Session = Depends(get_db),
+    current_user: UserRecord = Depends(require_roles("admin", "analyst")),
+):
     row = db.get(TransactionRecord, transaction_id)
     if row is None:
         raise HTTPException(status_code=404, detail="Transaction not found")
     old_status = row.review_status
     row.review_status = payload.decision
     row.review_note = payload.note
-    row.reviewer = payload.reviewer
+    row.reviewer = current_user.email
     add_audit(
-        db, "review_decision", transaction_id, payload.reviewer,
+        db, "review_decision", transaction_id, current_user.email,
         {"previous_status": old_status, "decision": payload.decision, "note": payload.note},
     )
     db.commit()
     db.refresh(row)
     return {"transaction": row.as_dict(), "audit_event": {
         "event_type": "review_decision", "transaction_id": transaction_id,
-        "actor": payload.reviewer, "details": {"decision": payload.decision, "note": payload.note},
+        "actor": current_user.email, "details": {"decision": payload.decision, "note": payload.note},
     }}
 
 
 @app.get("/api/policies")
-def get_policy(db: Session = Depends(get_db)):
+def get_policy(db: Session = Depends(get_db), current_user: UserRecord = Depends(get_current_user)):
     policy = policy_for(db)
     db.commit()
     return {"low_max": policy.low_max, "review_max": policy.review_max,
@@ -216,7 +294,11 @@ def get_policy(db: Session = Depends(get_db)):
 
 
 @app.put("/api/policies")
-def update_policy(payload: PolicyUpdate, db: Session = Depends(get_db)):
+def update_policy(
+    payload: PolicyUpdate,
+    db: Session = Depends(get_db),
+    current_user: UserRecord = Depends(require_roles("admin")),
+):
     policy = policy_for(db)
     policy.low_max = payload.low_max
     policy.review_max = payload.review_max
@@ -229,14 +311,18 @@ def update_policy(payload: PolicyUpdate, db: Session = Depends(get_db)):
         ), policy.low_max, policy.review_max)
         for key, value in result.items():
             setattr(row, key, value)
-    add_audit(db, "policy_updated", "*", "demo-analyst", payload.model_dump())
+    add_audit(db, "policy_updated", "*", current_user.email, payload.model_dump())
     db.commit()
     return {"low_max": policy.low_max, "review_max": policy.review_max,
             "note": "Saved to the configured database. Existing analyst decisions are preserved."}
 
 
 @app.get("/api/audit")
-def audit_log(limit: int = Query(default=100, ge=1, le=500), db: Session = Depends(get_db)):
+def audit_log(
+    limit: int = Query(default=100, ge=1, le=500),
+    db: Session = Depends(get_db),
+    current_user: UserRecord = Depends(require_roles("admin", "analyst")),
+):
     rows = db.scalars(select(AuditEvent).order_by(desc(AuditEvent.timestamp)).limit(limit)).all()
     return {"items": [
         {"id": row.id, "event_type": row.event_type, "transaction_id": row.transaction_id,
