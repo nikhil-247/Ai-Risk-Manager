@@ -129,10 +129,6 @@ npm run build
 
 ## Docker Compose (PostgreSQL + API + frontend)
 
-```bash
-docker compose up --build
-```
-
 - Dashboard: http://localhost:5173
 - API: http://localhost:8000
 - Swagger docs: http://localhost:8000/docs
