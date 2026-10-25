@@ -29,7 +29,7 @@ type Evaluation = {
   confusion_matrix: { tp: number; fp: number; fn: number; tn: number }; warning: string;
 };
 type Page = "overview" | "transactions" | "investigations" | "model" | "policies" | "audit";
-type AuthUser = { id: string; email: string; role: "admin" | "analyst" | "viewer"; is_active: boolean; created_at: string };
+type AuthUser = { id: string; email: string; role: "admin" | "analyst" | "viewer"; is_active: boolean; tenant_name: string; created_at: string };
 type AuthPayload = { access_token: string; token_type: "bearer"; expires_in: number; user: AuthUser };
 
 const money = (amount: number) => new Intl.NumberFormat("en-US", {
@@ -324,7 +324,7 @@ export default function App() {
         <div><strong>risklens<span> AI</span></strong><small>RISK INTELLIGENCE</small></div>
         <button className="icon-button mobile-close" onClick={() => setMobileNav(false)} aria-label="Close navigation"><X size={18}/></button>
       </div>
-      <div className="workspace-switch"><div className="workspace-avatar">N</div><div><strong>Northstar Payments</strong><small>Demo workspace</small></div><ChevronDown size={15}/></div>
+      <div className="workspace-switch"><div className="workspace-avatar">{authUser.tenant_name.slice(0, 1).toUpperCase()}</div><div><strong>{authUser.tenant_name}</strong><small>{authUser.tenant_name === "Northstar Payments" ? "Demo workspace" : "Tenant workspace"}</small></div><ChevronDown size={15}/></div>
       <nav>
         {navGroups.map((group) => <div className="nav-group" key={group.title}>
           <div className="nav-label">{group.title}</div>
