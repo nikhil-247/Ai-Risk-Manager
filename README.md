@@ -2,74 +2,73 @@
 
 **Explainable Fraud Intelligence & Risk Management Platform**
 
-RiskLens AI is a full-stack decision-support platform for transaction risk analysis. It combines a React dashboard, a FastAPI service, auditable review workflows, configurable risk policies, batch CSV scoring, and reproducible ML evaluation utilities.
+RiskLens AI is a full-stack transaction-risk decision-support application with a React dashboard, FastAPI endpoints, SQLAlchemy persistence, human review workflows, configurable risk policies, CSV batch scoring, audit events and an offline ML benchmark pipeline.
 
-> **Project status:** early-stage MVP foundation. Demo transaction records and heuristic scoring are for product demonstrations only. They are not a trained fraud model and must not be presented as benchmark performance or used to make real payment decisions.
+> **Status:** active MVP. The dashboard's interactive custom scorer is a transparent demo heuristic, not a trained classifier. A separate public-benchmark training script is provided and generates a report only after you supply and evaluate the dataset. Do not use this project to approve or decline real payments.
 
-## Why RiskLens AI?
+## Capabilities
 
-Fraud operations have to balance two costly errors: missing fraudulent transactions and flagging legitimate customers. RiskLens is designed to make that trade-off visible and reviewable rather than hiding it behind a single accuracy number.
+### Working application foundation
+- Risk dashboard with transaction counts, risk buckets, flagged amount and review status.
+- Search and filter transaction records.
+- Transaction detail drawer with score reasons and signal attributes.
+- Record fraud, legitimate or review-pending decisions, with reviewer notes.
+- Risk threshold configuration persisted to the configured database.
+- CSV batch scoring with validation and downloadable output.
+- Audit trail for review actions and policy updates.
+- FastAPI OpenAPI / Swagger documentation.
+- SQLite for local development; PostgreSQL in Docker Compose.
+- GitHub Actions jobs for backend/ML tests and frontend production compilation.
 
-### Current MVP capabilities
+### Benchmark ML pipeline
+- Validates the public credit-card fraud CSV schema and numeric features.
+- Defaults to chronological train/validation/test partitions (60/20/20).
+- Fits preprocessing on training data only and uses class-weighted Random Forest.
+- Selects a decision threshold on validation data using explicit false-positive / false-negative cost assumptions.
+- Reports held-out precision, recall, F1, accuracy, PR-AUC (average precision), ROC-AUC, confusion matrix, baseline metrics, data hash and split counts.
+- Saves a model artifact and JSON report locally; generated files are intentionally not committed.
 
-- Dashboard with transaction, amount, risk and review metrics.
-- Transaction list with text search and risk/status filtering.
-- Transaction detail view with an explainable rule-based demo score.
-- Human review actions: mark a case as confirmed fraud, legitimate, or still under review.
-- Configurable risk thresholds through the API.
-- CSV batch scoring with input validation and downloadable results from the UI.
-- Evaluation metrics endpoint using clearly labelled synthetic demonstration labels.
-- FastAPI OpenAPI documentation and backend tests.
-- Docker Compose setup for local development.
-- GitHub Actions workflow for automated backend checks.
+The online transaction form continues to use the labelled heuristic demo scorer because the public benchmark's anonymized features are not equivalent to the dashboard's merchant-style fields. Do not represent the offline benchmark as live inference.
 
-### Planned next milestones
+## Stack
 
-- Train and evaluate models using a real public benchmark with a leakage-safe split.
-- Persist transactions, decisions and audit events in PostgreSQL.
-- Add model versioning, calibrated probability estimates and richer feature attribution.
-- Add authentication, role-based access and production deployment hardening.
-- Add optional LLM-generated investigation summaries with grounded evidence.
-
-Features are moved from planned to implemented only after the corresponding code and tests exist.
+| Layer | Technology |
+|---|---|
+| Frontend | React, TypeScript, Vite, Recharts, Lucide |
+| API | FastAPI, Pydantic |
+| Persistence | SQLAlchemy, SQLite locally, PostgreSQL via Docker |
+| ML evaluation | Python, pandas, NumPy, scikit-learn, joblib |
+| Quality | Pytest, GitHub Actions |
+| Local deployment | Docker Compose |
 
 ## Architecture
 
 ```text
-React + TypeScript + Vite
-        │ HTTP / JSON
+React + TypeScript
+        │ /api JSON
         ▼
-FastAPI application
-  ├── Transaction API
-  ├── Rule-based demo risk scoring
-  ├── Review / decision workflow
-  ├── Policy thresholds
-  └── Evaluation and CSV batch scoring
-        │
-        └── In-memory demo store (resets on restart)
+FastAPI ────────────── SQLAlchemy ───────── SQLite (local)
+  ├─ Transactions                         PostgreSQL (Compose)
+  ├─ Reviews / audit
+  ├─ Risk policy
+  ├─ CSV batch scorer
+  └─ Evaluation report ◄──── artifacts/benchmark_report.json
+                                      ▲
+CSV benchmark ── train_benchmark.py ──┴── fraud_pipeline.joblib
 ```
 
-The current foundation intentionally uses a lightweight in-memory store so it can run without paid services or API keys. It is a development/demo setup, not a multi-user production database.
+## Quick start: local development
 
-## Quick start
+Requirements: Python 3.11+, Node.js 20+, npm and Git.
 
-### Requirements
-
-- Python 3.11 or newer
-- Node.js 20 or newer and npm
-- Git
-- Optional: Docker Desktop with Docker Compose
-
-### 1. Clone the repository
+### 1. Clone
 
 ```bash
 git clone https://github.com/nikhil-247/Ai-Risk-Manager.git
 cd Ai-Risk-Manager
 ```
 
-### 2. Start the API
-
-Windows PowerShell:
+### 2. Run the API (Windows PowerShell)
 
 ```powershell
 py -3.11 -m venv .venv
@@ -79,7 +78,7 @@ pip install -r backend/requirements.txt
 uvicorn backend.app.main:app --reload --port 8000
 ```
 
-macOS / Linux:
+macOS/Linux:
 
 ```bash
 python3.11 -m venv .venv
@@ -89,9 +88,9 @@ pip install -r backend/requirements.txt
 uvicorn backend.app.main:app --reload --port 8000
 ```
 
-The API will be available at http://localhost:8000 and interactive API docs at http://localhost:8000/docs.
+The local default is SQLite. Transactions, policies and audit events persist in `risklens.db` across restarts.
 
-### 3. Start the frontend
+### 3. Run the frontend
 
 Open a second terminal:
 
@@ -101,88 +100,106 @@ npm install
 npm run dev
 ```
 
-Open the Vite URL shown in the terminal (usually http://localhost:5173). The frontend proxies `/api` requests to the backend.
+Open http://localhost:5173. The Vite dev server proxies `/api` calls to the local API on port 8000.
 
-### Run with Docker
+### 4. Run all backend and ML checks
+
+```bash
+pip install -r backend/requirements.txt -r ml/requirements.txt
+pytest -q
+```
+
+Frontend production compile:
+
+```bash
+cd frontend
+npm install
+npm run build
+```
+
+## Docker Compose (PostgreSQL + API + frontend)
 
 ```bash
 docker compose up --build
 ```
 
-- Frontend: http://localhost:5173
+- Dashboard: http://localhost:5173
 - API: http://localhost:8000
-- API docs: http://localhost:8000/docs
+- Swagger docs: http://localhost:8000/docs
+- Health check: http://localhost:8000/api/health
 
-## API overview
+Compose stores database data in a named volume. The Compose password fallback is for local development only. Set `POSTGRES_PASSWORD` in a local ignored `.env` file before sharing or exposing the services. This MVP is not hardened for public production deployment.
 
-| Method | Endpoint | Purpose |
+## Public benchmark setup
+
+The raw benchmark is not stored in Git. Obtain the public ULB/Kaggle Credit Card Fraud Detection dataset from its publisher/host after reviewing applicable terms. Place the CSV at:
+
+```text
+data/raw/creditcard.csv
+```
+
+Then install the ML requirements and run:
+
+```bash
+pip install -r ml/requirements.txt
+python -m ml.train_benchmark --data data/raw/creditcard.csv
+```
+
+Optional arguments:
+
+```bash
+python -m ml.train_benchmark --data data/raw/creditcard.csv --trees 30
+python -m ml.train_benchmark --data data/raw/creditcard.csv --split stratified
+python -m ml.train_benchmark --data data/raw/creditcard.csv --false-positive-cost 5 --false-negative-cost 100
+```
+
+Outputs:
+- `artifacts/fraud_pipeline.joblib`: trained pipeline, features and selected threshold.
+- `artifacts/benchmark_report.json`: held-out metrics consumed by `GET /api/evaluation` when present.
+
+For Docker, keep `artifacts/` available next to `docker-compose.yml`; Compose mounts this directory read-only into the API. Generated artifacts and raw rows are excluded from Git by design.
+
+### Split and metric choices
+
+The default temporal split sorts by `Time`: first 60% for training, next 20% for threshold selection, final 20% as a held-out test. Use `--split stratified` for a conventional stratified comparison; temporal partitioning can fail if a partition lacks one class. Preprocessing is fit only on training data. The final threshold is chosen from validation data using explicit cost assumptions, and final test labels are not used for threshold selection.
+
+Cost values are illustrative user-provided units until a merchant supplies approved assumptions. Read [docs/EVALUATION.md](docs/EVALUATION.md) before making metric claims.
+
+## API reference
+
+| Method | Endpoint | Function |
 |---|---|---|
-| GET | `/api/health` | Service health |
+| GET | `/api/health` | API and database readiness |
 | GET | `/api/summary` | Dashboard summary |
-| GET | `/api/transactions` | Searchable/filterable transactions |
-| GET | `/api/transactions/{id}` | Transaction details |
-| POST | `/api/transactions/score` | Score one transaction |
-| POST | `/api/transactions/batch` | Validate and score CSV-uploaded rows |
-| POST | `/api/reviews/{id}` | Record a review decision |
-| GET | `/api/policies` | Read risk policy |
-| PUT | `/api/policies` | Update demo risk thresholds |
-| GET | `/api/evaluation` | Demonstration evaluation metrics |
+| GET | `/api/transactions` | Search/filter transactions |
+| GET | `/api/transactions/{id}` | Transaction detail |
+| POST | `/api/transactions/score` | Transparent demo score |
+| POST | `/api/transactions/batch` | Validate and score CSV rows |
+| POST | `/api/reviews/{id}` | Save a human review decision |
+| GET / PUT | `/api/policies` | Read/update score thresholds |
+| GET | `/api/audit` | View persisted audit events |
+| GET | `/api/evaluation` | Benchmark report if generated, otherwise demo disclaimer |
 
-See the generated OpenAPI schema at `/openapi.json` or use Swagger UI at `/docs`.
+## Security and data honesty
 
-## Risk scoring and interpretation
+- No authentication or tenant separation is implemented yet. Do not expose this deployment publicly with real data.
+- Use synthetic or approved anonymized data only.
+- Local Docker default credentials are not production secrets.
+- Audit events persist, but are not cryptographically tamper-evident.
+- Heuristic points are not calibrated probabilities and never trigger real payment actions.
+- The public benchmark's anonymized features do not support the merchant-style online form without a separate, validated feature adapter.
+- Raw dataset, SQLite database, model artifacts and `.env` are ignored by Git.
 
-The initial scoring engine is a transparent **demonstration heuristic**, not a trained classifier. It assigns risk points based on amount, transaction velocity proxy, unusual hour and cross-border flag where such input fields are provided. Reasons are returned alongside the score. The rules and thresholds are examples and are not calibrated to any specific merchant.
+## Roadmap
 
-The UI and API deliberately call these values a *risk score*, not a validated probability of fraud. Do not connect the current demo rules to a payment processor or automatically decline real transactions.
+1. Add Alembic migrations and stronger database lifecycle handling.
+2. Add real authentication, RBAC and tenant boundaries.
+3. Validate a merchant-like model feature schema and integrate inference only after testing.
+4. Add model versioning, threshold approvals, drift detection and alerting.
+5. Deploy with secrets management, observability, rate limits and security review.
 
-## Evaluation integrity
-
-Synthetic demo records allow a reviewer to explore the interface offline. Metrics computed from these records are examples for exercising the evaluation screen only. They do not establish real-world model quality.
-
-For credible model reporting, use a documented public benchmark, maintain a separate held-out test set, prevent leakage, report class prevalence and confusion-matrix counts, and prioritize precision, recall and PR-AUC over accuracy alone. Quantify false-positive cost only when the underlying cost assumptions are stated.
-
-## Configuration
-
-The initial MVP requires no API key. Optional integrations should use environment variables and a local `.env` file. Never commit credentials, access tokens, customer data or raw financial records. The repository's `.gitignore` excludes common environment and Python artifact files.
-
-## Development checks
-
-Backend tests:
-
-```bash
-pip install -r backend/requirements.txt
-pytest -q
-```
-
-Frontend production build:
-
-```bash
-cd frontend
-npm ci
-npm run build
-```
-
-## Security and privacy notes
-
-- Use only synthetic or appropriately anonymized data for development.
-- The current MVP has no authentication and stores state in process memory; do not expose it as a production service.
-- Treat uploaded CSV content as untrusted input. The API validates expected columns and limits upload size.
-- Risk decisions should remain auditable and subject to human review.
-- Never use generated explanations as proof of fraud; they summarize the scoring rules that fired.
-
-## Contributing
-
-1. Create a feature branch.
-2. Make a focused change and add or update tests.
-3. Run backend tests and the frontend production build.
-4. Document limitations and any new environment variables.
-5. Open a pull request describing the change and its verification.
+See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) and [docs/EVALUATION.md](docs/EVALUATION.md).
 
 ## License
 
-No license has been added yet. Until a license is chosen, default copyright rules apply and reuse is not automatically granted.
-
----
-
-Built as a fintech risk-management engineering project, with a focus on explainability, evaluation integrity and reviewable decisions.
+No license has been added yet, so default copyright rules apply and reuse is not automatically granted.
