@@ -16,12 +16,21 @@ from backend.app.database import get_db
 from backend.app.models import UserRecord
 
 JWT_ALGORITHM = "HS256"
-JWT_SECRET = os.getenv(
-    "RISKLENS_JWT_SECRET",
-    "local-development-secret-change-this-before-deploy-2026",
-)
+RISKLENS_ENV = os.getenv("RISKLENS_ENV", "development").strip().lower()
+_DEVELOPMENT_JWT_SECRET = "local-development-secret-change-this-before-deploy-2026"
+
+if RISKLENS_ENV not in {"development", "test", "production"}:
+    raise RuntimeError("RISKLENS_ENV must be development, test, or production")
+
+_configured_secret = os.getenv("RISKLENS_JWT_SECRET", "").strip()
+if RISKLENS_ENV == "production" and not _configured_secret:
+    raise RuntimeError("RISKLENS_JWT_SECRET is required when RISKLENS_ENV=production")
+
+JWT_SECRET = _configured_secret or _DEVELOPMENT_JWT_SECRET
 if len(JWT_SECRET) < 32:
     raise RuntimeError("RISKLENS_JWT_SECRET must contain at least 32 characters")
+if RISKLENS_ENV == "production" and JWT_SECRET == _DEVELOPMENT_JWT_SECRET:
+    raise RuntimeError("The built-in development JWT secret cannot be used in production")
 ACCESS_TOKEN_MINUTES = int(os.getenv("RISKLENS_ACCESS_TOKEN_MINUTES", "30"))
 if not 5 <= ACCESS_TOKEN_MINUTES <= 1440:
     raise RuntimeError("RISKLENS_ACCESS_TOKEN_MINUTES must be between 5 and 1440")
@@ -108,6 +117,11 @@ def bootstrap_admin(db: Session) -> None:
         raise RuntimeError("RISKLENS_BOOTSTRAP_ADMIN_EMAIL must be a valid email address")
     existing = db.scalar(select(UserRecord).where(UserRecord.email == email))
     if existing is not None:
+        if existing.role != "admin":
+            raise RuntimeError(
+                "Bootstrap email already belongs to a non-admin account. "
+                "Choose a different bootstrap email; roles are never auto-promoted."
+            )
         return
     db.add(UserRecord(
         id=str(uuid4()), email=email, password_hash=hash_password(password),
