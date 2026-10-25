@@ -4,7 +4,9 @@ from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import StaticPool
 
+from backend.app.auth import create_access_token, hash_password
 from backend.app.database import Base, get_db
+from backend.app.models import UserRecord
 from backend.app.main import app
 from backend.app.seed import seed_demo_data
 
@@ -18,6 +20,22 @@ def client():
     )
     TestingSessionLocal = sessionmaker(bind=engine, autoflush=False, expire_on_commit=False)
     Base.metadata.create_all(bind=engine)
+    with sessionmaker(bind=engine, autoflush=False, expire_on_commit=False)() as db:
+        db.add_all([
+            UserRecord(
+                id="test-admin-id", email="admin@example.com",
+                password_hash=hash_password("test-admin-password-123!"), role="admin", is_active=True,
+            ),
+            UserRecord(
+                id="test-analyst-id", email="analyst@example.com",
+                password_hash=hash_password("test-analyst-password-123!"), role="analyst", is_active=True,
+            ),
+            UserRecord(
+                id="test-viewer-id", email="viewer@example.com",
+                password_hash=hash_password("test-viewer-password-123!"), role="viewer", is_active=True,
+            ),
+        ])
+        db.commit()
 
     def override_get_db():
         db = TestingSessionLocal()
@@ -30,6 +48,7 @@ def client():
     with TestingSessionLocal() as db:
         seed_demo_data(db)
     with TestClient(app) as test_client:
+        test_client.headers.update({"Authorization": f"Bearer {create_access_token('test-admin-id')}"})
         yield test_client
     app.dependency_overrides.clear()
     Base.metadata.drop_all(bind=engine)
@@ -87,7 +106,7 @@ def test_review_decision_is_persisted_and_audited(client):
     audit = client.get("/api/audit")
     assert audit.status_code == 200
     assert audit.json()["total"] == 1
-    assert audit.json()["items"][0]["actor"] == "pytest"
+    assert audit.json()["items"][0]["actor"] == "admin@example.com"
 
 
 def test_invalid_policy_rejected(client):
@@ -135,3 +154,91 @@ def test_evaluation_marks_demo_data_honestly(client):
     assert response.status_code == 200
     assert response.json()["status"] == "illustrative_only"
     assert response.json()["source"] == "synthetic_demo"
+
+
+def test_auth_login_and_me(client):
+    client.headers.pop("Authorization", None)
+    response = client.post(
+        "/api/auth/login",
+        data={"username": "admin@example.com", "password": "test-admin-password-123!"},
+    )
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["token_type"] == "bearer"
+    assert payload["user"]["role"] == "admin"
+    client.headers.update({"Authorization": f"Bearer {payload['access_token']}"})
+    me = client.get("/api/auth/me")
+    assert me.status_code == 200
+    assert me.json()["email"] == "admin@example.com"
+
+
+def test_protected_endpoint_rejects_anonymous_client(client):
+    client.headers.pop("Authorization", None)
+    response = client.get("/api/summary")
+    assert response.status_code == 401
+
+
+def test_registration_only_creates_viewers(client):
+    response = client.post(
+        "/api/auth/register",
+        json={"email": "new.viewer@example.com", "password": "new-viewer-password-123!"},
+    )
+    assert response.status_code == 201
+    assert response.json()["role"] == "viewer"
+    assert "password_hash" not in response.json()
+    duplicate = client.post(
+        "/api/auth/register",
+        json={"email": "NEW.VIEWER@example.com", "password": "new-viewer-password-123!"},
+    )
+    assert duplicate.status_code == 409
+
+
+def test_viewer_cannot_change_policy_or_submit_reviews(client):
+    viewer = client.post(
+        "/api/auth/login",
+        data={"username": "viewer@example.com", "password": "test-viewer-password-123!"},
+    ).json()
+    admin_headers = dict(client.headers)
+    client.headers.update({"Authorization": f"Bearer {viewer['access_token']}"})
+    policy = client.put("/api/policies", json={"low_max": 20, "review_max": 50})
+    review = client.post(
+        "/api/reviews/txn_1001",
+        json={"decision": "confirmed_fraud", "note": "viewer attempt"},
+    )
+    assert policy.status_code == 403
+    assert review.status_code == 403
+    client.headers.clear()
+    client.headers.update(admin_headers)
+
+
+def test_analyst_can_review_but_cannot_change_policy(client):
+    analyst = client.post(
+        "/api/auth/login",
+        data={"username": "analyst@example.com", "password": "test-analyst-password-123!"},
+    ).json()
+    admin_headers = dict(client.headers)
+    client.headers.update({"Authorization": f"Bearer {analyst['access_token']}"})
+    policy = client.put("/api/policies", json={"low_max": 20, "review_max": 50})
+    review = client.post(
+        "/api/reviews/txn_1001",
+        json={"decision": "legitimate", "note": "analyst review", "reviewer": "spoofed-user"},
+    )
+    assert policy.status_code == 403
+    assert review.status_code == 200
+    assert review.json()["transaction"]["reviewer"] == "analyst@example.com"
+    assert review.json()["audit_event"]["actor"] == "analyst@example.com"
+    client.headers.clear()
+    client.headers.update(admin_headers)
+
+
+def test_admin_can_create_role_scoped_user(client):
+    response = client.post(
+        "/api/auth/admin/users",
+        json={
+            "email": "new.analyst@example.com",
+            "password": "new-analyst-password-123!",
+            "role": "analyst",
+        },
+    )
+    assert response.status_code == 201
+    assert response.json()["role"] == "analyst"
