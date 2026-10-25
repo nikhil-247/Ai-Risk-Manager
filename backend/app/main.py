@@ -23,7 +23,7 @@ from backend.app.auth import (
     hash_password, normalize_email, require_roles, verify_password,
 )
 from backend.app.database import get_db
-from backend.app.models import AuditEvent, RiskPolicyRecord, TransactionRecord, UserRecord
+from backend.app.models import AuditEvent, RiskPolicyRecord, TenantRecord, TransactionRecord, UserRecord
 from backend.app.risk_scoring import ScoreRequest, score_features
 from backend.app.seed import seed_demo_data
 
@@ -100,18 +100,28 @@ class PolicyUpdate(BaseModel):
         return value
 
 
-def policy_for(db: Session) -> RiskPolicyRecord:
-    policy = db.get(RiskPolicyRecord, 1)
+def policy_for(db: Session, tenant_id: str) -> RiskPolicyRecord:
+    policy = db.scalar(
+        select(RiskPolicyRecord).where(RiskPolicyRecord.tenant_id == tenant_id)
+    )
     if policy is None:
-        policy = RiskPolicyRecord(id=1, low_max=29, review_max=64)
+        policy = RiskPolicyRecord(tenant_id=tenant_id, low_max=29, review_max=64)
         db.add(policy)
         db.flush()
     return policy
 
 
-def add_audit(db: Session, event_type: str, transaction_id: str, actor: str, details: dict) -> AuditEvent:
+def add_audit(
+    db: Session,
+    tenant_id: str,
+    event_type: str,
+    transaction_id: str,
+    actor: str,
+    details: dict,
+) -> AuditEvent:
     event = AuditEvent(
         id=str(uuid4()),
+        tenant_id=tenant_id,
         event_type=event_type,
         transaction_id=transaction_id,
         actor=actor,
@@ -126,12 +136,14 @@ def transaction_count(db: Session) -> int:
     return int(db.scalar(select(func.count()).select_from(TransactionRecord)) or 0)
 
 
-def _public_user(user: UserRecord) -> dict:
+def _public_user(user: UserRecord, db: Session) -> dict:
+    tenant = db.get(TenantRecord, user.tenant_id)
     return {
         "id": user.id,
         "email": user.email,
         "role": user.role,
         "is_active": user.is_active,
+        "tenant_name": tenant.name if tenant else "Workspace",
         "created_at": user.created_at.isoformat(),
     }
 
@@ -140,11 +152,13 @@ def _create_user(
     db: Session,
     email: str,
     password: str,
+    tenant_id: str,
     role: str = "viewer",
     created_by: str | None = None,
 ) -> UserRecord:
     user = UserRecord(
         id=str(uuid4()),
+        tenant_id=tenant_id,
         email=normalize_email(email),
         password_hash=hash_password(password),
         role=role,
@@ -153,6 +167,7 @@ def _create_user(
     db.add(user)
     add_audit(
         db,
+        user.tenant_id,
         "user_created",
         f"user:{user.id}",
         created_by or user.email,
@@ -174,8 +189,15 @@ def _create_user(
 
 @app.post("/api/auth/register", status_code=status.HTTP_201_CREATED)
 def register(payload: RegisterRequest, db: Session = Depends(get_db)):
-    """Public registration can create viewer accounts only; elevated roles require an admin."""
-    return _public_user(_create_user(db, payload.email, payload.password, "viewer"))
+    """Create a new isolated workspace whose first member is its administrator."""
+    local_part = payload.email.split("@", 1)[0][:100]
+    tenant = TenantRecord(id=str(uuid4()), name=f"{local_part}'s workspace")
+    db.add(tenant)
+    db.flush()
+    user = _create_user(
+        db, payload.email, payload.password, tenant_id=tenant.id, role="admin"
+    )
+    return _public_user(user, db)
 
 
 @app.post("/api/auth/login")
@@ -202,13 +224,13 @@ def login(
         "access_token": create_access_token(user.id),
         "token_type": "bearer",
         "expires_in": ACCESS_TOKEN_MINUTES * 60,
-        "user": _public_user(user),
+        "user": _public_user(user, db),
     }
 
 
 @app.get("/api/auth/me")
-def who_am_i(current_user: UserRecord = Depends(get_current_user)):
-    return _public_user(current_user)
+def who_am_i(current_user: UserRecord = Depends(get_current_user), db: Session = Depends(get_db)):
+    return _public_user(current_user, db)
 
 
 @app.post("/api/auth/admin/users", status_code=status.HTTP_201_CREATED)
@@ -217,12 +239,13 @@ def create_user_as_admin(
     current_user: UserRecord = Depends(require_roles("admin")),
     db: Session = Depends(get_db),
 ):
-    return _public_user(
-        _create_user(
-            db, payload.email, payload.password, payload.role,
-            created_by=current_user.email,
-        )
+    user = _create_user(
+        db, payload.email, payload.password,
+        tenant_id=current_user.tenant_id,
+        role=payload.role,
+        created_by=current_user.email,
     )
+    return _public_user(user, db)
 
 
 @app.get("/api/health")
@@ -234,7 +257,9 @@ def health(db: Session = Depends(get_db)):
 
 @app.get("/api/summary")
 def summary(current_user: UserRecord = Depends(get_current_user), db: Session = Depends(get_db)):
-    rows = list(db.scalars(select(TransactionRecord)).all())
+    rows = list(db.scalars(
+        select(TransactionRecord).where(TransactionRecord.tenant_id == current_user.tenant_id)
+    ).all())
     total = len(rows)
     return {
         "total_transactions": total,
@@ -258,7 +283,7 @@ def transactions(
     current_user: UserRecord = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
-    query = select(TransactionRecord)
+    query = select(TransactionRecord).where(TransactionRecord.tenant_id == current_user.tenant_id)
     if search:
         needle = f"%{search.strip()}%"
         from sqlalchemy import or_
@@ -274,7 +299,10 @@ def transactions(
 
 @app.get("/api/transactions/{transaction_id}")
 def transaction_detail(transaction_id: str, current_user: UserRecord = Depends(get_current_user), db: Session = Depends(get_db)):
-    row = db.get(TransactionRecord, transaction_id)
+    row = db.scalar(select(TransactionRecord).where(
+        TransactionRecord.id == transaction_id,
+        TransactionRecord.tenant_id == current_user.tenant_id,
+    ))
     if row is None:
         raise HTTPException(status_code=404, detail="Transaction not found")
     return row.as_dict()
@@ -282,7 +310,7 @@ def transaction_detail(transaction_id: str, current_user: UserRecord = Depends(g
 
 @app.post("/api/transactions/score")
 def score_one(payload: ScoreRequest, current_user: UserRecord = Depends(get_current_user), db: Session = Depends(get_db)):
-    policy = policy_for(db)
+    policy = policy_for(db, current_user.tenant_id)
     return score_features(payload, policy.low_max, policy.review_max)
 
 
@@ -298,6 +326,7 @@ async def score_batch(file: UploadFile = File(...), current_user: UserRecord = D
         reader = csv.DictReader(io.StringIO(text))
         if "amount" not in set(reader.fieldnames or []):
             raise HTTPException(status_code=400, detail="CSV must include an amount column")
+        policy = policy_for(db, current_user.tenant_id)
         rows = []
         for line_number, row in enumerate(reader, start=2):
             try:
@@ -312,7 +341,6 @@ async def score_batch(file: UploadFile = File(...), current_user: UserRecord = D
                 )
             except (ValueError, TypeError, ValidationError) as exc:
                 raise HTTPException(status_code=400, detail=f"Invalid data on CSV line {line_number}: {exc}") from exc
-            policy = policy_for(db)
             rows.append({"row": line_number, **payload.model_dump(), **score_features(payload, policy.low_max, policy.review_max)})
             if len(rows) > 10_000:
                 raise HTTPException(status_code=400, detail="CSV cannot contain more than 10,000 data rows")
@@ -336,7 +364,7 @@ def review_transaction(
     row.review_note = payload.note
     row.reviewer = current_user.email
     add_audit(
-        db, "review_decision", transaction_id, current_user.email,
+        db, current_user.tenant_id, "review_decision", transaction_id, current_user.email,
         {"previous_status": old_status, "decision": payload.decision, "note": payload.note},
     )
     db.commit()
@@ -349,7 +377,7 @@ def review_transaction(
 
 @app.get("/api/policies")
 def get_policy(current_user: UserRecord = Depends(get_current_user), db: Session = Depends(get_db)):
-    policy = policy_for(db)
+    policy = policy_for(db, current_user.tenant_id)
     db.commit()
     return {"low_max": policy.low_max, "review_max": policy.review_max,
             "note": "Demo thresholds; not calibrated for production decisions."}
@@ -361,10 +389,12 @@ def update_policy(
     current_user: UserRecord = Depends(require_roles("admin")),
     db: Session = Depends(get_db),
 ):
-    policy = policy_for(db)
+    policy = policy_for(db, current_user.tenant_id)
     policy.low_max = payload.low_max
     policy.review_max = payload.review_max
-    for row in db.scalars(select(TransactionRecord)).all():
+    for row in db.scalars(
+        select(TransactionRecord).where(TransactionRecord.tenant_id == current_user.tenant_id)
+    ).all():
         result = score_features(ScoreRequest(
             amount=row.amount, currency=row.currency, country=row.country,
             transactions_last_hour=row.transactions_last_hour,
@@ -373,7 +403,10 @@ def update_policy(
         ), policy.low_max, policy.review_max)
         for key, value in result.items():
             setattr(row, key, value)
-    add_audit(db, "policy_updated", "*", current_user.email, payload.model_dump())
+    add_audit(
+        db, current_user.tenant_id, "policy_updated", "*",
+        current_user.email, payload.model_dump(),
+    )
     db.commit()
     return {"low_max": policy.low_max, "review_max": policy.review_max,
             "note": "Saved to the configured database. Existing analyst decisions are preserved."}
@@ -385,12 +418,20 @@ def audit_log(
     current_user: UserRecord = Depends(require_roles("admin", "analyst")),
     db: Session = Depends(get_db),
 ):
-    rows = db.scalars(select(AuditEvent).order_by(desc(AuditEvent.timestamp)).limit(limit)).all()
+    rows = db.scalars(
+        select(AuditEvent)
+        .where(AuditEvent.tenant_id == current_user.tenant_id)
+        .order_by(desc(AuditEvent.timestamp))
+        .limit(limit)
+    ).all()
     return {"items": [
         {"id": row.id, "event_type": row.event_type, "transaction_id": row.transaction_id,
          "actor": row.actor, "details": row.details, "timestamp": row.timestamp.isoformat()}
         for row in rows
-    ], "total": int(db.scalar(select(func.count()).select_from(AuditEvent)) or 0)}
+    ], "total": int(db.scalar(
+        select(func.count()).select_from(AuditEvent)
+        .where(AuditEvent.tenant_id == current_user.tenant_id)
+    ) or 0)}
 
 
 def demo_evaluation() -> dict:
