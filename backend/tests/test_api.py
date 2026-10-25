@@ -1,10 +1,15 @@
+import os
+import subprocess
+import sys
+from pathlib import Path
+
 import pytest
 from fastapi.testclient import TestClient
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import StaticPool
 
-from backend.app.auth import create_access_token, hash_password
+from backend.app.auth import bootstrap_admin, create_access_token, hash_password
 from backend.app.database import Base, get_db
 from backend.app.models import UserRecord
 from backend.app.main import app
@@ -283,3 +288,48 @@ def test_batch_upload_enforces_size_limit(client):
         files={"file": ("large.csv", oversized, "text/csv")},
     )
     assert response.status_code == 413
+
+
+def test_bootstrap_admin_does_not_promote_existing_viewer(monkeypatch):
+    engine = create_engine(
+        "sqlite://",
+        connect_args={"check_same_thread": False},
+        poolclass=StaticPool,
+    )
+    TestingSessionLocal = sessionmaker(bind=engine, autoflush=False, expire_on_commit=False)
+    Base.metadata.create_all(bind=engine)
+    monkeypatch.setenv("RISKLENS_BOOTSTRAP_ADMIN_EMAIL", "existing@example.com")
+    monkeypatch.setenv("RISKLENS_BOOTSTRAP_ADMIN_PASSWORD", "bootstrap-password-123!")
+    with TestingSessionLocal() as db:
+        db.add(UserRecord(
+            id="existing-viewer", email="existing@example.com",
+            password_hash=hash_password("viewer-password-123!"),
+            role="viewer", is_active=True,
+        ))
+        db.commit()
+        with pytest.raises(RuntimeError, match="roles are never auto-promoted"):
+            bootstrap_admin(db)
+        assert db.get(UserRecord, "existing-viewer").role == "viewer"
+    Base.metadata.drop_all(bind=engine)
+    engine.dispose()
+
+
+def test_production_requires_explicit_non_development_jwt_secret():
+    env = os.environ.copy()
+    env["RISKLENS_ENV"] = "production"
+    env.pop("RISKLENS_JWT_SECRET", None)
+    root = Path(__file__).resolve().parents[2]
+    missing_secret = subprocess.run(
+        [sys.executable, "-c", "import backend.app.auth"],
+        cwd=root, env=env, capture_output=True, text=True, check=False,
+    )
+    assert missing_secret.returncode != 0
+    assert "RISKLENS_JWT_SECRET is required when RISKLENS_ENV=production" in missing_secret.stderr
+
+    env["RISKLENS_JWT_SECRET"] = "local-development-secret-change-this-before-deploy-2026"
+    unsafe_secret = subprocess.run(
+        [sys.executable, "-c", "import backend.app.auth"],
+        cwd=root, env=env, capture_output=True, text=True, check=False,
+    )
+    assert unsafe_secret.returncode != 0
+    assert "cannot be used in production" in unsafe_secret.stderr
