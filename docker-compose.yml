@@ -21,6 +21,9 @@ services:
     environment:
       DATABASE_URL: postgresql+psycopg://risklens:${POSTGRES_PASSWORD:-risklens_local_dev_password}@db:5432/risklens
       RISKLENS_EVALUATION_PATH: /app/artifacts/benchmark_report.json
+      RISKLENS_JWT_SECRET: ${RISKLENS_JWT_SECRET:-local-development-secret-change-this-before-deploy-2026}
+      RISKLENS_BOOTSTRAP_ADMIN_EMAIL: ${RISKLENS_BOOTSTRAP_ADMIN_EMAIL:-}
+      RISKLENS_BOOTSTRAP_ADMIN_PASSWORD: ${RISKLENS_BOOTSTRAP_ADMIN_PASSWORD:-}
     ports:
       - "8000:8000"
     volumes:
