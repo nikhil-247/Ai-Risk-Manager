@@ -11,35 +11,43 @@ from sqlalchemy.pool import StaticPool
 
 from backend.app.auth import bootstrap_admin, create_access_token, hash_password
 from backend.app.database import Base, get_db
-from backend.app.models import UserRecord
+from backend.app.models import TenantRecord, UserRecord
+from backend.app.tenancy import DEFAULT_TENANT_ID, DEFAULT_TENANT_NAME
 from backend.app.main import app
 from backend.app.seed import seed_demo_data
 
 
 @pytest.fixture()
-def client():
+def client(monkeypatch):
     engine = create_engine(
         "sqlite://",
         connect_args={"check_same_thread": False},
         poolclass=StaticPool,
     )
     TestingSessionLocal = sessionmaker(bind=engine, autoflush=False, expire_on_commit=False)
+    monkeypatch.setattr("backend.app.database.SessionLocal", TestingSessionLocal)
     Base.metadata.create_all(bind=engine)
     with sessionmaker(bind=engine, autoflush=False, expire_on_commit=False)() as db:
+        db.add(TenantRecord(id=DEFAULT_TENANT_ID, name=DEFAULT_TENANT_NAME))
+        db.flush()
         db.add_all([
             UserRecord(
+                tenant_id=DEFAULT_TENANT_ID,
                 id="test-admin-id", email="admin@example.com",
                 password_hash=hash_password("test-admin-password-123!"), role="admin", is_active=True,
             ),
             UserRecord(
+                tenant_id=DEFAULT_TENANT_ID,
                 id="test-analyst-id", email="analyst@example.com",
                 password_hash=hash_password("test-analyst-password-123!"), role="analyst", is_active=True,
             ),
             UserRecord(
+                tenant_id=DEFAULT_TENANT_ID,
                 id="test-viewer-id", email="viewer@example.com",
                 password_hash=hash_password("test-viewer-password-123!"), role="viewer", is_active=True,
             ),
             UserRecord(
+                tenant_id=DEFAULT_TENANT_ID,
                 id="test-disabled-id", email="disabled@example.com",
                 password_hash=hash_password("disabled-user-password-123!"), role="analyst", is_active=False,
             ),
@@ -188,14 +196,15 @@ def test_protected_endpoint_rejects_anonymous_client(client):
     assert response.status_code == 401
 
 
-def test_registration_only_creates_viewers(client):
+def test_registration_creates_an_isolated_workspace_admin(client):
     response = client.post(
         "/api/auth/register",
         json={"email": "new.viewer@example.com", "password": "new-viewer-password-123!"},
     )
     assert response.status_code == 201
-    assert response.json()["role"] == "viewer"
+    assert response.json()["role"] == "admin"
     assert "password_hash" not in response.json()
+    assert response.json()["tenant_name"] == "new.viewer's workspace"
     duplicate = client.post(
         "/api/auth/register",
         json={"email": "NEW.VIEWER@example.com", "password": "new-viewer-password-123!"},
@@ -301,13 +310,16 @@ def test_bootstrap_admin_does_not_promote_existing_viewer(monkeypatch):
     monkeypatch.setenv("RISKLENS_BOOTSTRAP_ADMIN_EMAIL", "existing@example.com")
     monkeypatch.setenv("RISKLENS_BOOTSTRAP_ADMIN_PASSWORD", "bootstrap-password-123!")
     with TestingSessionLocal() as db:
+        db.add(TenantRecord(id=DEFAULT_TENANT_ID, name=DEFAULT_TENANT_NAME))
+        db.flush()
         db.add(UserRecord(
+            tenant_id=DEFAULT_TENANT_ID,
             id="existing-viewer", email="existing@example.com",
             password_hash=hash_password("viewer-password-123!"),
             role="viewer", is_active=True,
         ))
         db.commit()
-        with pytest.raises(RuntimeError, match="roles are never auto-promoted"):
+        with pytest.raises(RuntimeError, match="Bootstrap email is already used"):
             bootstrap_admin(db)
         assert db.get(UserRecord, "existing-viewer").role == "viewer"
     Base.metadata.drop_all(bind=engine)
@@ -333,3 +345,64 @@ def test_production_requires_explicit_non_development_jwt_secret():
     )
     assert unsafe_secret.returncode != 0
     assert "cannot be used in production" in unsafe_secret.stderr
+
+
+def test_registered_workspace_cannot_read_or_change_default_tenant_data(client):
+    provisioned = client.post(
+        "/api/auth/admin/users",
+        json={
+            "email": "default.member@example.com",
+            "password": "default-member-password-123!",
+            "role": "viewer",
+        },
+    )
+    assert provisioned.status_code == 201
+
+    registered = client.post(
+        "/api/auth/register",
+        json={"email": "fresh.workspace@example.com", "password": "fresh-workspace-password-123!"},
+    )
+    assert registered.status_code == 201
+    assert registered.json()["role"] == "admin"
+
+    default_headers = dict(client.headers)
+    login = client.post(
+        "/api/auth/login",
+        data={"username": "fresh.workspace@example.com", "password": "fresh-workspace-password-123!"},
+    )
+    assert login.status_code == 200
+    client.headers.update({"Authorization": "Bearer " + login.json()["access_token"]})
+
+    summary = client.get("/api/summary")
+    assert summary.status_code == 200
+    assert summary.json()["total_transactions"] == 0
+    assert client.get("/api/transactions").json()["total"] == 0
+    assert client.get("/api/transactions/txn_1001").status_code == 404
+    review_from_other_tenant = client.post(
+        "/api/reviews/txn_1001",
+        json={"decision": "confirmed_fraud", "note": "cross-tenant attempt"},
+    )
+    assert review_from_other_tenant.status_code == 404
+
+    policy = client.get("/api/policies")
+    assert policy.status_code == 200
+    assert (policy.json()["low_max"], policy.json()["review_max"]) == (29, 64)
+    updated = client.put("/api/policies", json={"low_max": 10, "review_max": 40})
+    assert updated.status_code == 200
+    assert client.get("/api/policies").json()["low_max"] == 10
+
+    audit = client.get("/api/audit")
+    assert audit.status_code == 200
+    assert audit.json()["total"] == 2
+    assert {item["event_type"] for item in audit.json()["items"]} == {"user_created", "policy_updated"}
+
+    client.headers.clear()
+    client.headers.update(default_headers)
+    default_policy = client.get("/api/policies")
+    assert default_policy.status_code == 200
+    assert (default_policy.json()["low_max"], default_policy.json()["review_max"]) == (29, 64)
+    assert client.get("/api/transactions/txn_1001").status_code == 200
+    default_audit = client.get("/api/audit")
+    assert default_audit.status_code == 200
+    assert default_audit.json()["total"] == 1
+    assert default_audit.json()["items"][0]["details"]["email"] == "default.member@example.com"

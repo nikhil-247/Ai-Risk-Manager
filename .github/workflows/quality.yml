@@ -9,6 +9,20 @@ on:
 jobs:
   backend-and-ml-tests:
     runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_DB: risklens_ci
+          POSTGRES_USER: risklens
+          POSTGRES_PASSWORD: risklens_ci_password
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U risklens -d risklens_ci"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 20
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -21,6 +35,14 @@ jobs:
       - run: pip install -r backend/requirements.txt -r ml/requirements.txt
       - run: alembic -c backend/alembic.ini upgrade head
       - run: alembic -c backend/alembic.ini check
+      - name: Apply migrations on PostgreSQL
+        run: alembic -c backend/alembic.ini upgrade head
+        env:
+          DATABASE_URL: postgresql+psycopg://risklens:risklens_ci_password@localhost:5432/risklens_ci
+      - name: Check PostgreSQL schema drift
+        run: alembic -c backend/alembic.ini check
+        env:
+          DATABASE_URL: postgresql+psycopg://risklens:risklens_ci_password@localhost:5432/risklens_ci
       - run: pytest -q
 
   frontend-build:

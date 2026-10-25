@@ -1,10 +1,23 @@
 from datetime import datetime, timezone
 from typing import Any
 
-from sqlalchemy import Boolean, CheckConstraint, DateTime, Float, Integer, JSON, String, Text
+from sqlalchemy import (
+    Boolean, CheckConstraint, DateTime, Float, ForeignKey, Integer, JSON,
+    String, Text, UniqueConstraint,
+)
 from sqlalchemy.orm import Mapped, mapped_column
 
 from backend.app.database import Base
+
+
+class TenantRecord(Base):
+    __tablename__ = "tenants"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    name: Mapped[str] = mapped_column(String(120), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, default=lambda: datetime.now(timezone.utc)
+    )
 
 
 class UserRecord(Base):
@@ -14,6 +27,10 @@ class UserRecord(Base):
     )
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    tenant_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("tenants.id", name="fk_users_tenant_id_tenants"),
+        nullable=False, index=True,
+    )
     email: Mapped[str] = mapped_column(String(320), nullable=False, unique=True, index=True)
     password_hash: Mapped[str] = mapped_column(String(255), nullable=False)
     role: Mapped[str] = mapped_column(String(20), nullable=False, default="viewer")
@@ -27,6 +44,10 @@ class TransactionRecord(Base):
     __tablename__ = "transactions"
 
     id: Mapped[str] = mapped_column(String(80), primary_key=True)
+    tenant_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("tenants.id", name="fk_transactions_tenant_id_tenants"),
+        nullable=False, index=True,
+    )
     amount: Mapped[float] = mapped_column(Float, nullable=False)
     currency: Mapped[str] = mapped_column(String(3), default="USD", nullable=False)
     country: Mapped[str] = mapped_column(String(2), default="US", nullable=False)
@@ -75,8 +96,15 @@ class TransactionRecord(Base):
 
 class RiskPolicyRecord(Base):
     __tablename__ = "risk_policies"
+    __table_args__ = (
+        UniqueConstraint("tenant_id", name="uq_risk_policies_tenant_id"),
+    )
 
-    id: Mapped[int] = mapped_column(Integer, primary_key=True, default=1)
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    tenant_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("tenants.id", name="fk_risk_policies_tenant_id_tenants"),
+        nullable=False, index=True,
+    )
     low_max: Mapped[int] = mapped_column(Integer, nullable=False, default=29)
     review_max: Mapped[int] = mapped_column(Integer, nullable=False, default=64)
 
@@ -85,6 +113,10 @@ class AuditEvent(Base):
     __tablename__ = "audit_events"
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    tenant_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("tenants.id", name="fk_audit_events_tenant_id_tenants"),
+        nullable=False, index=True,
+    )
     event_type: Mapped[str] = mapped_column(String(80), nullable=False)
     transaction_id: Mapped[str] = mapped_column(String(80), nullable=False)
     actor: Mapped[str] = mapped_column(String(100), nullable=False)
