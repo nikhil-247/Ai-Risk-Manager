@@ -10,14 +10,20 @@ from pathlib import Path
 from typing import Literal
 from uuid import uuid4
 
-from fastapi import Depends, FastAPI, File, HTTPException, Query, UploadFile
+from fastapi import Depends, FastAPI, File, HTTPException, Query, UploadFile, status
+from fastapi.security import OAuth2PasswordRequestForm
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field, ValidationError, field_validator
 from sqlalchemy import desc, func, select
 from sqlalchemy.orm import Session
+from sqlalchemy.exc import IntegrityError
 
+from backend.app.auth import (
+    ACCESS_TOKEN_MINUTES, bootstrap_admin, create_access_token, get_current_user,
+    hash_password, normalize_email, require_roles, verify_password,
+)
 from backend.app.database import get_db
-from backend.app.models import AuditEvent, RiskPolicyRecord, TransactionRecord
+from backend.app.models import AuditEvent, RiskPolicyRecord, TransactionRecord, UserRecord
 from backend.app.risk_scoring import ScoreRequest, score_features
 from backend.app.seed import seed_demo_data
 
@@ -26,6 +32,7 @@ from backend.app.seed import seed_demo_data
 async def lifespan(_: FastAPI):
     from backend.app.database import SessionLocal
     with SessionLocal() as db:
+        bootstrap_admin(db)
         seed_demo_data(db)
     yield
 
@@ -46,10 +53,29 @@ app.add_middleware(
 )
 
 
+class RegisterRequest(BaseModel):
+    email: str = Field(min_length=5, max_length=320)
+    password: str = Field(min_length=12, max_length=128)
+
+    @field_validator("email")
+    @classmethod
+    def normalize_and_validate_email(cls, value: str) -> str:
+        normalized = normalize_email(value)
+        if normalized.count("@") != 1 or any(ch.isspace() for ch in normalized):
+            raise ValueError("A valid email address is required")
+        local, domain = normalized.rsplit("@", 1)
+        if not local or "." not in domain or domain.startswith(".") or domain.endswith("."):
+            raise ValueError("A valid email address is required")
+        return normalized
+
+
+class AdminUserCreate(RegisterRequest):
+    role: Literal["admin", "analyst", "viewer"] = "viewer"
+
+
 class ReviewRequest(BaseModel):
     decision: Literal["confirmed_fraud", "legitimate", "needs_review"]
     note: str = Field(default="", max_length=1000)
-    reviewer: str = Field(default="demo-analyst", min_length=1, max_length=100)
 
 
 class PolicyUpdate(BaseModel):
@@ -91,6 +117,75 @@ def transaction_count(db: Session) -> int:
     return int(db.scalar(select(func.count()).select_from(TransactionRecord)) or 0)
 
 
+def _public_user(user: UserRecord) -> dict:
+    return {
+        "id": user.id,
+        "email": user.email,
+        "role": user.role,
+        "is_active": user.is_active,
+        "created_at": user.created_at.isoformat(),
+    }
+
+
+def _create_user(db: Session, email: str, password: str, role: str = "viewer") -> UserRecord:
+    user = UserRecord(
+        id=str(uuid4()),
+        email=normalize_email(email),
+        password_hash=hash_password(password),
+        role=role,
+        is_active=True,
+    )
+    db.add(user)
+    try:
+        db.commit()
+    except IntegrityError:
+        db.rollback()
+        raise HTTPException(status_code=409, detail="An account with this email already exists") from None
+    db.refresh(user)
+    return user
+
+
+@app.post("/api/auth/register", status_code=status.HTTP_201_CREATED)
+def register(payload: RegisterRequest, db: Session = Depends(get_db)):
+    """Public registration can create viewer accounts only; elevated roles require an admin."""
+    return _public_user(_create_user(db, payload.email, payload.password, "viewer"))
+
+
+@app.post("/api/auth/login")
+def login(
+    form_data: OAuth2PasswordRequestForm = Depends(),
+    db: Session = Depends(get_db),
+):
+    email = normalize_email(form_data.username)
+    user = db.scalar(select(UserRecord).where(UserRecord.email == email))
+    if user is None or not user.is_active or not verify_password(form_data.password, user.password_hash):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Incorrect email or password",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+    return {
+        "access_token": create_access_token(user.id),
+        "token_type": "bearer",
+        "expires_in": ACCESS_TOKEN_MINUTES * 60,
+        "user": _public_user(user),
+    }
+
+
+@app.get("/api/auth/me")
+def who_am_i(current_user: UserRecord = Depends(get_current_user)):
+    return _public_user(current_user)
+
+
+@app.post("/api/auth/admin/users", status_code=status.HTTP_201_CREATED)
+def create_user_as_admin(
+    payload: AdminUserCreate,
+    _: UserRecord = Depends(require_roles("admin")),
+    db: Session = Depends(get_db),
+):
+    return _public_user(_create_user(db, payload.email, payload.password, payload.role))
+
+
 @app.get("/api/health")
 def health(db: Session = Depends(get_db)):
     # A database roundtrip makes this useful as a container readiness probe.
@@ -99,7 +194,7 @@ def health(db: Session = Depends(get_db)):
 
 
 @app.get("/api/summary")
-def summary(db: Session = Depends(get_db)):
+def summary(current_user: UserRecord = Depends(get_current_user), db: Session = Depends(get_db)):
     rows = list(db.scalars(select(TransactionRecord)).all())
     total = len(rows)
     return {
@@ -121,6 +216,7 @@ def transactions(
     risk: Literal["all", "low", "medium", "high"] = "all",
     status: Literal["all", "legitimate", "confirmed_fraud", "needs_review"] = "all",
     limit: int = Query(default=100, ge=1, le=500),
+    current_user: UserRecord = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
     query = select(TransactionRecord)
@@ -138,7 +234,7 @@ def transactions(
 
 
 @app.get("/api/transactions/{transaction_id}")
-def transaction_detail(transaction_id: str, db: Session = Depends(get_db)):
+def transaction_detail(transaction_id: str, current_user: UserRecord = Depends(get_current_user), db: Session = Depends(get_db)):
     row = db.get(TransactionRecord, transaction_id)
     if row is None:
         raise HTTPException(status_code=404, detail="Transaction not found")
@@ -146,13 +242,13 @@ def transaction_detail(transaction_id: str, db: Session = Depends(get_db)):
 
 
 @app.post("/api/transactions/score")
-def score_one(payload: ScoreRequest, db: Session = Depends(get_db)):
+def score_one(payload: ScoreRequest, current_user: UserRecord = Depends(get_current_user), db: Session = Depends(get_db)):
     policy = policy_for(db)
     return score_features(payload, policy.low_max, policy.review_max)
 
 
 @app.post("/api/transactions/batch")
-async def score_batch(file: UploadFile = File(...), db: Session = Depends(get_db)):
+async def score_batch(file: UploadFile = File(...), current_user: UserRecord = Depends(get_current_user), db: Session = Depends(get_db)):
     if not file.filename or not file.filename.lower().endswith(".csv"):
         raise HTTPException(status_code=400, detail="Upload a .csv file")
     raw = await file.read()
@@ -187,28 +283,33 @@ async def score_batch(file: UploadFile = File(...), db: Session = Depends(get_db
 
 
 @app.post("/api/reviews/{transaction_id}")
-def review_transaction(transaction_id: str, payload: ReviewRequest, db: Session = Depends(get_db)):
+def review_transaction(
+    transaction_id: str,
+    payload: ReviewRequest,
+    current_user: UserRecord = Depends(require_roles("admin", "analyst")),
+    db: Session = Depends(get_db),
+):
     row = db.get(TransactionRecord, transaction_id)
     if row is None:
         raise HTTPException(status_code=404, detail="Transaction not found")
     old_status = row.review_status
     row.review_status = payload.decision
     row.review_note = payload.note
-    row.reviewer = payload.reviewer
+    row.reviewer = current_user.email
     add_audit(
-        db, "review_decision", transaction_id, payload.reviewer,
+        db, "review_decision", transaction_id, current_user.email,
         {"previous_status": old_status, "decision": payload.decision, "note": payload.note},
     )
     db.commit()
     db.refresh(row)
     return {"transaction": row.as_dict(), "audit_event": {
         "event_type": "review_decision", "transaction_id": transaction_id,
-        "actor": payload.reviewer, "details": {"decision": payload.decision, "note": payload.note},
+        "actor": current_user.email, "details": {"decision": payload.decision, "note": payload.note},
     }}
 
 
 @app.get("/api/policies")
-def get_policy(db: Session = Depends(get_db)):
+def get_policy(current_user: UserRecord = Depends(get_current_user), db: Session = Depends(get_db)):
     policy = policy_for(db)
     db.commit()
     return {"low_max": policy.low_max, "review_max": policy.review_max,
@@ -216,7 +317,11 @@ def get_policy(db: Session = Depends(get_db)):
 
 
 @app.put("/api/policies")
-def update_policy(payload: PolicyUpdate, db: Session = Depends(get_db)):
+def update_policy(
+    payload: PolicyUpdate,
+    current_user: UserRecord = Depends(require_roles("admin")),
+    db: Session = Depends(get_db),
+):
     policy = policy_for(db)
     policy.low_max = payload.low_max
     policy.review_max = payload.review_max
@@ -229,14 +334,18 @@ def update_policy(payload: PolicyUpdate, db: Session = Depends(get_db)):
         ), policy.low_max, policy.review_max)
         for key, value in result.items():
             setattr(row, key, value)
-    add_audit(db, "policy_updated", "*", "demo-analyst", payload.model_dump())
+    add_audit(db, "policy_updated", "*", current_user.email, payload.model_dump())
     db.commit()
     return {"low_max": policy.low_max, "review_max": policy.review_max,
             "note": "Saved to the configured database. Existing analyst decisions are preserved."}
 
 
 @app.get("/api/audit")
-def audit_log(limit: int = Query(default=100, ge=1, le=500), db: Session = Depends(get_db)):
+def audit_log(
+    limit: int = Query(default=100, ge=1, le=500),
+    current_user: UserRecord = Depends(require_roles("admin", "analyst")),
+    db: Session = Depends(get_db),
+):
     rows = db.scalars(select(AuditEvent).order_by(desc(AuditEvent.timestamp)).limit(limit)).all()
     return {"items": [
         {"id": row.id, "event_type": row.event_type, "transaction_id": row.transaction_id,
