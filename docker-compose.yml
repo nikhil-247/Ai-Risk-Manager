@@ -4,7 +4,7 @@ services:
     environment:
       POSTGRES_DB: risklens
       POSTGRES_USER: risklens
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-risklens_local_dev_password}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env (see .env.example)}
     volumes:
       - risklens-postgres-data:/var/lib/postgresql/data
     healthcheck:
@@ -19,9 +19,11 @@ services:
       context: .
       dockerfile: backend/Dockerfile
     environment:
-      DATABASE_URL: postgresql+psycopg://risklens:${POSTGRES_PASSWORD:-risklens_local_dev_password}@db:5432/risklens
+      DATABASE_URL: postgresql+psycopg://risklens:${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env (see .env.example)}@db:5432/risklens
+      RISKLENS_ENV: ${RISKLENS_ENV:-development}
       RISKLENS_EVALUATION_PATH: /app/artifacts/benchmark_report.json
-      RISKLENS_JWT_SECRET: ${RISKLENS_JWT_SECRET:-local-development-secret-change-this-before-deploy-2026}
+      RISKLENS_JWT_SECRET: ${RISKLENS_JWT_SECRET:?Set RISKLENS_JWT_SECRET in .env (see .env.example)}
+      RISKLENS_CORS_ORIGINS: ${RISKLENS_CORS_ORIGINS:-http://localhost:5173,http://127.0.0.1:5173}
       RISKLENS_BOOTSTRAP_ADMIN_EMAIL: ${RISKLENS_BOOTSTRAP_ADMIN_EMAIL:-}
       RISKLENS_BOOTSTRAP_ADMIN_PASSWORD: ${RISKLENS_BOOTSTRAP_ADMIN_PASSWORD:-}
     ports:
