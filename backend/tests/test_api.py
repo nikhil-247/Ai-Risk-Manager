@@ -18,13 +18,14 @@ from backend.app.seed import seed_demo_data
 
 
 @pytest.fixture()
-def client():
+def client(monkeypatch):
     engine = create_engine(
         "sqlite://",
         connect_args={"check_same_thread": False},
         poolclass=StaticPool,
     )
     TestingSessionLocal = sessionmaker(bind=engine, autoflush=False, expire_on_commit=False)
+    monkeypatch.setattr("backend.app.database.SessionLocal", TestingSessionLocal)
     Base.metadata.create_all(bind=engine)
     with sessionmaker(bind=engine, autoflush=False, expire_on_commit=False)() as db:
         db.add(TenantRecord(id=DEFAULT_TENANT_ID, name=DEFAULT_TENANT_NAME))
