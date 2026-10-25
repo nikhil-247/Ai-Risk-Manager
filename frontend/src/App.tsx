@@ -46,6 +46,11 @@ async function api<T>(path: string, init?: RequestInit): Promise<T> {
   const response = await fetch(path, { ...init, headers });
   if (!response.ok) {
     const body = await response.json().catch(() => null);
+    if (response.status === 401 && path !== "/api/auth/login") {
+      window.localStorage.removeItem("risklens_token");
+      window.localStorage.removeItem("risklens_user");
+      window.dispatchEvent(new Event("risklens:unauthorized"));
+    }
     throw new Error(body?.detail || `Request failed (${response.status})`);
   }
   return response.json() as Promise<T>;
@@ -272,13 +277,22 @@ export default function App() {
     } catch (error) { setToast(error instanceof Error ? error.message : "Could not load audit log"); }
   }
   useEffect(() => { if (page === "audit") void loadAudit(); }, [page]);
+  useEffect(() => {
+    const handleUnauthorized = () => {
+      setAuthToken("");
+      setAuthUser(null);
+      setSelected(null);
+      setLoading(false);
+    };
+    window.addEventListener("risklens:unauthorized", handleUnauthorized);
+    return () => window.removeEventListener("risklens:unauthorized", handleUnauthorized);
+  }, []);
 
   function exportTransactions() {
     const headers = ["id", "amount", "currency", "country", "risk_score", "risk_category", "review_status", "reasons"];
     const lines = [headers.join(","), ...filtered.map((t) => headers.map((key) => {
       const value = (t as unknown as Record<string, unknown>)[key];
-      const stringValue = Array.isArray(value) ? value.join("; ") : String(value ?? "");
-      return `"${stringValue.replaceAll('"', '""')}"`;
+      return csvCell(value);
     }).join(","))];
     downloadCsv(lines.join("\n"), "risklens-transactions.csv");
   }
@@ -402,10 +416,16 @@ function ModelPage({evaluation,scoringForm,setScoringForm,runScore,singleScore}:
   return <div className="model-layout"><section className={`panel model-warning ${isBenchmark ? "model-warning-success" : ""}`}><div className="notice-icon">{isBenchmark ? <ShieldCheck size={18}/> : <AlertOctagon size={18}/>}</div><div><strong>{isBenchmark ? "Held-out benchmark evaluation available" : "Evaluation integrity notice"}</strong><p>{evaluation.warning}{isBenchmark ? ` Dataset: ${evaluation.dataset}. The threshold was selected on validation data; these metrics are from the separate held-out test partition.` : " Synthetic examples are only for exercising the interface and must not be quoted as model performance."}</p></div></section><div className="model-metrics"><Metric label={isBenchmark ? "Precision · test set" : "Precision · demo only"} value={`${(evaluation.precision*100).toFixed(1)}%`} delta={isBenchmark ? "Held-out benchmark" : "Synthetic labels"} icon={<Gauge size={17}/>} tone="blue"/><Metric label={isBenchmark ? "Recall · test set" : "Recall · demo only"} value={`${(evaluation.recall*100).toFixed(1)}%`} delta={isBenchmark ? "Held-out benchmark" : "Synthetic labels"} icon={<ShieldCheck size={17}/>} tone="amber"/><Metric label={isBenchmark ? "PR-AUC · test set" : "PR-AUC · demo only"} value={evaluation.pr_auc == null ? "—" : evaluation.pr_auc.toFixed(3)} delta={isBenchmark ? "Average precision" : "No benchmark loaded"} icon={<Activity size={17}/>} tone="red"/><Metric label={isBenchmark ? "F1 · test set" : "F1 · demo only"} value={evaluation.f1 == null ? "—" : evaluation.f1.toFixed(3)} delta={isBenchmark ? "Held-out benchmark" : "Synthetic labels"} icon={<Gauge size={17}/>} tone="green"/></div><section className="panel"><div className="panel-heading"><div><h2>Confusion matrix</h2><p>{isBenchmark ? `Held-out test partition · decision threshold ${evaluation.threshold?.toFixed(3) ?? "reported in artifact"}` : "Demo rules score versus hand-authored sample labels"}</p></div></div><div className="confusion-grid"><div className="confusion-empty"/><div className="confusion-head">Predicted positive</div><div className="confusion-head">Predicted negative</div><div className="confusion-label">Actual positive</div><div className="confusion-cell tp"><strong>{evaluation.confusion_matrix.tp}</strong><span>True positive</span></div><div className="confusion-cell fn"><strong>{evaluation.confusion_matrix.fn}</strong><span>False negative</span></div><div className="confusion-label">Actual negative</div><div className="confusion-cell fp"><strong>{evaluation.confusion_matrix.fp}</strong><span>False positive</span></div><div className="confusion-cell tn"><strong>{evaluation.confusion_matrix.tn}</strong><span>True negative</span></div></div><p className="small-note">{isBenchmark ? `Accuracy: ${(evaluation.accuracy*100).toFixed(1)}%. These results are a held-out estimate for the named public dataset, not a guarantee of production performance. Cost assumptions and dataset limitations must be reviewed before reuse.` : "A real benchmark pipeline and held-out test evaluation are required before these metrics can be interpreted as model quality."}</p></section><section className="panel score-playground"><div className="panel-heading"><div><h2>Try a transaction</h2><p>Run the current explainable demo rules on custom values.</p></div><span className="tag tag-amber">RULES ENGINE</span></div><div className="score-form">{fields.map(([key,label,type])=><label key={key}>{label}<input type={type} value={scoringForm[key]} min={key==="hour_of_day"?0:0} max={key==="hour_of_day"?23:undefined} onChange={(e)=>setScoringForm({...scoringForm,[key]:e.target.value})}/></label>)}<label className="check-field"><input type="checkbox" checked={scoringForm.cross_border} onChange={(e)=>setScoringForm({...scoringForm,cross_border:e.target.checked})}/> Cross-border transaction</label><button className="btn btn-primary" onClick={runScore}>Calculate risk score <Activity size={15}/></button></div>{singleScore&&<div className="score-result"><ScoreRing score={Number(singleScore.risk_score??0)}/><div><RiskPill risk={String(singleScore.risk_category)}/><h3>{String(singleScore.risk_score)} / 100 risk points</h3><p>{String(singleScore.disclaimer)}</p><strong>Triggered signals</strong><ul>{(singleScore.reasons as string[]).map(reason=><li key={reason}>{reason}</li>)}</ul></div></div>}</section></div>;
 }
 
+function csvCell(value: unknown): string {
+  const raw = Array.isArray(value) ? value.join("; ") : String(value ?? "");
+  // Prevent formula execution when exported CSV is opened in spreadsheet software.
+  const safe = /^[\\u0000-\\u0020]*[=+\\-@]/.test(raw) ? `'${raw}` : raw;
+  return `"${safe.replaceAll('"', '""')}"`;
+}
 function downloadRows(rows:Record<string,unknown>[]){
   if(!rows.length)return;
   const keys=Object.keys(rows[0]);
-  const csv=[keys.join(","),...rows.map(row=>keys.map(key=>`"${String(row[key]??"").replaceAll('"','""')}"`).join(","))].join("\n");
+  const csv=[keys.join(","),...rows.map(row=>keys.map(key=>csvCell(row[key])).join(","))].join("\n");
   downloadCsv(csv,"risklens-batch-scores.csv");
 }
 function downloadCsv(csv: string, filename: string) {
