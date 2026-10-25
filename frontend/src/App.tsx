@@ -2,7 +2,7 @@ import { useEffect, useMemo, useState } from "react";
 import React from "react";
 import {
   Activity, AlertOctagon, ArrowUpRight, Bell, BrainCircuit, Check, ChevronDown,
-  CircleHelp, Clock3, Download, FileSearch, Filter, Gauge, LayoutDashboard,
+  CircleHelp, Clock3, Download, FileSearch, Filter, Gauge, LayoutDashboard, LogOut,
   ListFilter, LockKeyhole, Menu, MoreHorizontal, Search, ShieldAlert, ShieldCheck,
   SlidersHorizontal, Upload, X,
 } from "lucide-react";
@@ -29,6 +29,8 @@ type Evaluation = {
   confusion_matrix: { tp: number; fp: number; fn: number; tn: number }; warning: string;
 };
 type Page = "overview" | "transactions" | "investigations" | "model" | "policies" | "audit";
+type AuthUser = { id: string; email: string; role: "admin" | "analyst" | "viewer"; is_active: boolean; created_at: string };
+type AuthPayload = { access_token: string; token_type: "bearer"; expires_in: number; user: AuthUser };
 
 const money = (amount: number) => new Intl.NumberFormat("en-US", {
   style: "currency", currency: "USD", maximumFractionDigits: 2,
@@ -38,7 +40,10 @@ const dateTime = (value: string) => new Date(value).toLocaleString([], {
 });
 
 async function api<T>(path: string, init?: RequestInit): Promise<T> {
-  const response = await fetch(path, init);
+  const headers = new Headers(init?.headers);
+  const token = window.localStorage.getItem("risklens_token");
+  if (token) headers.set("Authorization", `Bearer ${token}`);
+  const response = await fetch(path, { ...init, headers });
   if (!response.ok) {
     const body = await response.json().catch(() => null);
     throw new Error(body?.detail || `Request failed (${response.status})`);
@@ -72,7 +77,60 @@ function ScoreRing({ score }: { score: number }) {
   </div>;
 }
 
+function AuthScreen({ onAuthenticated }: { onAuthenticated: (payload: AuthPayload) => void }) {
+  const [mode, setMode] = useState<"login" | "register">("login");
+  const [email, setEmail] = useState("");
+  const [password, setPassword] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState("");
+
+  async function submit(event: React.FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    setBusy(true);
+    setError("");
+    try {
+      if (mode === "register") {
+        await api("/api/auth/register", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ email, password }),
+        });
+      }
+      const payload = await api<AuthPayload>("/api/auth/login", {
+        method: "POST",
+        headers: { "Content-Type": "application/x-www-form-urlencoded" },
+        body: new URLSearchParams({ username: email, password }),
+      });
+      onAuthenticated(payload);
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : "Authentication failed");
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  return <div className="auth-screen">
+    <form className="auth-card" onSubmit={(event) => void submit(event)}>
+      <div className="auth-brand"><div className="brand-mark"><ShieldCheck size={22}/></div><div><strong>risklens<span> AI</span></strong><small>RISK INTELLIGENCE</small></div></div>
+      <span className="auth-eyebrow">SECURE WORKSPACE</span>
+      <h1>{mode === "login" ? "Welcome back." : "Create your account."}</h1>
+      <p>{mode === "login" ? "Sign in to investigate risk and review transaction activity." : "New registrations start with read-only viewer access."}</p>
+      <label>Email address<input autoComplete="email" type="email" value={email} onChange={(event) => setEmail(event.target.value)} required maxLength={320} placeholder="you@company.com"/></label>
+      <label>Password<input autoComplete={mode === "login" ? "current-password" : "new-password"} type="password" value={password} onChange={(event) => setPassword(event.target.value)} required minLength={12} maxLength={128} placeholder="At least 12 characters"/></label>
+      {error && <div className="auth-error" role="alert">{error}</div>}
+      <button className="btn btn-primary auth-submit" type="submit" disabled={busy}>{busy ? "Please wait…" : mode === "login" ? "Sign in securely" : "Create viewer account"}</button>
+      <button className="auth-switch" type="button" onClick={() => { setMode(mode === "login" ? "register" : "login"); setError(""); }}>{mode === "login" ? "Need an account? Register" : "Already registered? Sign in"}</button>
+      <small className="auth-footnote">Demo risk scores are decision-support signals, not live payment decisions.</small>
+    </form>
+  </div>;
+}
+
 export default function App() {
+  const [authToken, setAuthToken] = useState(() => window.localStorage.getItem("risklens_token") || "");
+  const [authUser, setAuthUser] = useState<AuthUser | null>(() => {
+    try { return JSON.parse(window.localStorage.getItem("risklens_user") || "null") as AuthUser | null; }
+    catch { return null; }
+  });
   const [page, setPage] = useState<Page>("overview");
   const [transactions, setTransactions] = useState<Transaction[]>([]);
   const [summary, setSummary] = useState<Summary | null>(null);
@@ -121,7 +179,27 @@ export default function App() {
     }
   }
 
-  useEffect(() => { void refresh(); }, []);
+  useEffect(() => {
+    if (!authToken) { setLoading(false); return; }
+    let cancelled = false;
+    (async () => {
+      try {
+        const user = await api<AuthUser>("/api/auth/me");
+        if (cancelled) return;
+        setAuthUser(user);
+        window.localStorage.setItem("risklens_user", JSON.stringify(user));
+        await refresh();
+      } catch {
+        if (cancelled) return;
+        window.localStorage.removeItem("risklens_token");
+        window.localStorage.removeItem("risklens_user");
+        setAuthToken("");
+        setAuthUser(null);
+        setLoading(false);
+      }
+    })();
+    return () => { cancelled = true; };
+  }, [authToken]);
   useEffect(() => {
     if (!toast) return;
     const timer = window.setTimeout(() => setToast(""), 3200);
@@ -217,6 +295,14 @@ export default function App() {
     model: "Model evaluation", policies: "Risk policies", audit: "Audit trail",
   } satisfies Record<Page, string>)[page];
 
+  if (!authToken || !authUser) return <AuthScreen onAuthenticated={(payload) => {
+    window.localStorage.setItem("risklens_token", payload.access_token);
+    window.localStorage.setItem("risklens_user", JSON.stringify(payload.user));
+    setAuthToken(payload.access_token);
+    setAuthUser(payload.user);
+    setLoading(true);
+  }} />;
+
   return <div className="app-shell">
     <aside className={`sidebar ${mobileNav ? "sidebar-open" : ""}`}>
       <div className="brand">
@@ -228,7 +314,7 @@ export default function App() {
       <nav>
         {navGroups.map((group) => <div className="nav-group" key={group.title}>
           <div className="nav-label">{group.title}</div>
-          {group.items.map(({ id, label, icon: Icon, badge }) => <button key={id} className={`nav-item ${page === id ? "active" : ""}`} onClick={() => { setPage(id); setMobileNav(false); }}>
+          {group.items.filter(({ id }) => id !== "audit" || authUser.role !== "viewer").map(({ id, label, icon: Icon, badge }) => <button key={id} className={`nav-item ${page === id ? "active" : ""}`} onClick={() => { setPage(id); setMobileNav(false); }}>
             <Icon size={17}/><span>{label}</span>{badge && <em>{summary?.pending_reviews ?? "!"}</em>}
           </button>)}
         </div>)}
@@ -236,7 +322,7 @@ export default function App() {
       <div className="sidebar-bottom">
         <div className="model-status"><span className="pulse-dot"/><div><strong>Demo rules engine</strong><small>API connected when online</small></div></div>
         <button className="nav-item" onClick={() => setToast("Demo environment: no real payments are connected.")}><CircleHelp size={17}/><span>Help & documentation</span></button>
-        <div className="profile-row"><div className="profile-avatar">NK</div><div><strong>Demo Analyst</strong><small>Risk operations</small></div><MoreHorizontal size={18}/></div>
+        <div className="profile-row"><div className="profile-avatar">{authUser.email.slice(0, 2).toUpperCase()}</div><div><strong>{authUser.email}</strong><small>{authUser.role} account</small></div><button className="icon-button" title="Sign out" aria-label="Sign out" onClick={() => { window.localStorage.removeItem("risklens_token"); window.localStorage.removeItem("risklens_user"); setAuthToken(""); setAuthUser(null); setSelected(null); }}><LogOut size={16}/></button></div>
       </div>
     </aside>
 
@@ -266,7 +352,7 @@ export default function App() {
             </section>}
 
             {page === "model" && evaluation && <ModelPage evaluation={evaluation} scoringForm={scoringForm} setScoringForm={setScoringForm} runScore={runScore} singleScore={singleScore}/>}
-            {page === "policies" && <section className="panel policy-panel"><div className="panel-heading"><div><h2>Risk routing thresholds</h2><p>Scores are demo rule points, not fraud probabilities.</p></div><span className="tag tag-amber">DEMO CONFIGURATION</span></div><div className="policy-scale"><div className="scale-segment safe-segment">LOW <span>0–{policyLow}</span></div><div className="scale-segment medium-segment">REVIEW <span>{policyLow + 1}–{policyReview}</span></div><div className="scale-segment high-segment">HIGH <span>{policyReview + 1}–100</span></div></div><div className="policy-controls"><label><span><strong>Low risk maximum</strong><small>Scores up to this value stay in the low-risk band.</small></span><input type="number" min={0} max={98} value={policyLow} onChange={(e) => setPolicyLow(Number(e.target.value))}/></label><label><span><strong>Manual review maximum</strong><small>Higher scores route to priority review.</small></span><input type="number" min={1} max={100} value={policyReview} onChange={(e) => setPolicyReview(Number(e.target.value))}/></label></div>{policyReview <= policyLow && <div className="inline-error">Review threshold must be greater than low-risk threshold.</div>}<div className="policy-footer"><p><LockKeyhole size={14}/> Changes are kept in memory for this demo session and reset on restart.</p><button disabled={policyReview <= policyLow || policyLow < 0 || policyReview > 100} className="btn btn-primary" onClick={() => void savePolicy()}>Save policy <Check size={15}/></button></div></section>}
+            {page === "policies" && <section className="panel policy-panel"><div className="panel-heading"><div><h2>Risk routing thresholds</h2><p>Scores are demo rule points, not fraud probabilities.</p></div><span className="tag tag-amber">DEMO CONFIGURATION</span></div><div className="policy-scale"><div className="scale-segment safe-segment">LOW <span>0–{policyLow}</span></div><div className="scale-segment medium-segment">REVIEW <span>{policyLow + 1}–{policyReview}</span></div><div className="scale-segment high-segment">HIGH <span>{policyReview + 1}–100</span></div></div><div className="policy-controls"><label><span><strong>Low risk maximum</strong><small>Scores up to this value stay in the low-risk band.</small></span><input type="number" min={0} max={98} value={policyLow} onChange={(e) => setPolicyLow(Number(e.target.value))}/></label><label><span><strong>Manual review maximum</strong><small>Higher scores route to priority review.</small></span><input type="number" min={1} max={100} value={policyReview} onChange={(e) => setPolicyReview(Number(e.target.value))}/></label></div>{policyReview <= policyLow && <div className="inline-error">Review threshold must be greater than low-risk threshold.</div>}<div className="policy-footer"><p><LockKeyhole size={14}/> Changes are kept in memory for this demo session and reset on restart.</p>{authUser.role === "admin" && <button disabled={policyReview <= policyLow || policyLow < 0 || policyReview > 100} className="btn btn-primary" onClick={() => void savePolicy()}>Save policy <Check size={15}/></button>}</div></section>}
 
             {page === "audit" && <section className="panel"><div className="panel-heading"><div><h2>Recent audit events</h2><p>Review and policy events recorded by the API during this process.</p></div><button className="btn btn-secondary btn-small" onClick={() => void loadAudit()}><Activity size={14}/> Refresh log</button></div>{auditRows.length === 0 ? <div className="empty-state">No events yet. Review a transaction or update a risk policy to create an audit event.</div> : <div className="audit-list">{auditRows.map((row) => <div className="audit-item" key={String(row.id)}><div className="audit-icon"><ShieldCheck size={16}/></div><div><strong>{String(row.event_type).replaceAll("_", " ")}</strong><span>Actor: {String(row.actor)} · Transaction: {String(row.transaction_id)}</span><small>{dateTime(String(row.timestamp))}</small><code>{JSON.stringify(row.details)}</code></div></div>)}</div>}</section>}
           </>}
@@ -274,7 +360,7 @@ export default function App() {
       </div>
     </main>
 
-    {selected && <div className="drawer-backdrop" onClick={() => setSelected(null)} role="presentation"><aside className="detail-drawer" onClick={(e) => e.stopPropagation()}><div className="drawer-header"><div><span className="eyebrow">TRANSACTION INSPECTOR</span><h2>{selected.id}</h2></div><button className="icon-button" onClick={() => setSelected(null)} aria-label="Close transaction details"><X size={18}/></button></div><div className="drawer-body"><div className="drawer-score"><ScoreRing score={selected.risk_score}/><div><RiskPill risk={selected.risk_category}/><h3>{money(selected.amount)}</h3><span className="muted">{selected.country} · {selected.currency}</span><p className="muted">{dateTime(selected.created_at)}</p></div></div><div className="drawer-section"><div className="section-title">RECOMMENDED ROUTING</div><div className="recommendation"><ShieldAlert size={18}/><div><strong>{selected.recommended_action.replaceAll("_", " ")}</strong><p>Recommendation only. No payment action is connected.</p></div></div></div><div className="drawer-section"><div className="section-title">WHY WAS THIS FLAGGED?</div><div className="reason-list">{selected.reasons.map((reason) => <div key={reason}><span><Check size={13}/></span>{reason}</div>)}</div></div><div className="drawer-section"><div className="section-title">SIGNALS</div><div className="signal-grid"><Signal label="Account age" value={`${selected.account_age_days} days`}/><Signal label="Txns / hour" value={String(selected.transactions_last_hour)}/><Signal label="Transaction hour" value={`${selected.hour_of_day}:00`}/><Signal label="Cross-border" value={selected.cross_border ? "Yes" : "No"}/></div></div><div className="drawer-section"><div className="section-title">REVIEW STATUS</div><StatusPill status={selected.review_status}/><textarea className="review-note" value={reviewNote} onChange={(e) => setReviewNote(e.target.value)} maxLength={1000} placeholder="Add a note to the review audit trail…"/><div className="review-actions"><button className="btn btn-danger" onClick={() => void submitReview(selected.id, "confirmed_fraud")}>Confirm fraud</button><button className="btn btn-secondary" onClick={() => void submitReview(selected.id, "legitimate")}>Mark legitimate</button></div><button className="review-reset" onClick={() => void submitReview(selected.id, "needs_review")}>Keep in review queue</button></div><div className="drawer-disclaimer"><LockKeyhole size={14}/> Demo-only scoring. Always validate signals and use human judgment.</div></div></aside></div>}
+    {selected && <div className="drawer-backdrop" onClick={() => setSelected(null)} role="presentation"><aside className="detail-drawer" onClick={(e) => e.stopPropagation()}><div className="drawer-header"><div><span className="eyebrow">TRANSACTION INSPECTOR</span><h2>{selected.id}</h2></div><button className="icon-button" onClick={() => setSelected(null)} aria-label="Close transaction details"><X size={18}/></button></div><div className="drawer-body"><div className="drawer-score"><ScoreRing score={selected.risk_score}/><div><RiskPill risk={selected.risk_category}/><h3>{money(selected.amount)}</h3><span className="muted">{selected.country} · {selected.currency}</span><p className="muted">{dateTime(selected.created_at)}</p></div></div><div className="drawer-section"><div className="section-title">RECOMMENDED ROUTING</div><div className="recommendation"><ShieldAlert size={18}/><div><strong>{selected.recommended_action.replaceAll("_", " ")}</strong><p>Recommendation only. No payment action is connected.</p></div></div></div><div className="drawer-section"><div className="section-title">WHY WAS THIS FLAGGED?</div><div className="reason-list">{selected.reasons.map((reason) => <div key={reason}><span><Check size={13}/></span>{reason}</div>)}</div></div><div className="drawer-section"><div className="section-title">SIGNALS</div><div className="signal-grid"><Signal label="Account age" value={`${selected.account_age_days} days`}/><Signal label="Txns / hour" value={String(selected.transactions_last_hour)}/><Signal label="Transaction hour" value={`${selected.hour_of_day}:00`}/><Signal label="Cross-border" value={selected.cross_border ? "Yes" : "No"}/></div></div><div className="drawer-section"><div className="section-title">REVIEW STATUS</div><StatusPill status={selected.review_status}/>{authUser.role !== "viewer" ? <><textarea className="review-note" value={reviewNote} onChange={(e) => setReviewNote(e.target.value)} maxLength={1000} placeholder="Add a note to the review audit trail…"/><div className="review-actions"><button className="btn btn-danger" onClick={() => void submitReview(selected.id, "confirmed_fraud")}>Confirm fraud</button><button className="btn btn-secondary" onClick={() => void submitReview(selected.id, "legitimate")}>Mark legitimate</button></div><button className="review-reset" onClick={() => void submitReview(selected.id, "needs_review")}>Keep in review queue</button></> : <p className="muted">Read-only account. An analyst or admin must record review decisions.</p>}</div><div className="drawer-disclaimer"><LockKeyhole size={14}/> Demo-only scoring. Always validate signals and use human judgment.</div></div></aside></div>}
 
     {toast && <div className="toast"><Check size={16}/>{toast}<button onClick={() => setToast("")} aria-label="Dismiss notification"><X size={14}/></button></div>}
   </div>;
