@@ -10,7 +10,7 @@ from pathlib import Path
 from typing import Literal
 from uuid import uuid4
 
-from fastapi import Depends, FastAPI, File, HTTPException, Query, UploadFile, status
+from fastapi import Depends, FastAPI, File, HTTPException, Query, Response, UploadFile, status
 from fastapi.security import OAuth2PasswordRequestForm
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field, ValidationError, field_validator
@@ -44,9 +44,18 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
+CORS_ORIGINS = [
+    origin.strip()
+    for origin in os.getenv(
+        "RISKLENS_CORS_ORIGINS",
+        "http://localhost:5173,http://127.0.0.1:5173",
+    ).split(",")
+    if origin.strip()
+]
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:5173", "http://127.0.0.1:5173"],
+    allow_origins=CORS_ORIGINS,
     allow_credentials=False,
     allow_methods=["GET", "POST", "PUT", "OPTIONS"],
     allow_headers=["Content-Type"],
@@ -127,7 +136,13 @@ def _public_user(user: UserRecord) -> dict:
     }
 
 
-def _create_user(db: Session, email: str, password: str, role: str = "viewer") -> UserRecord:
+def _create_user(
+    db: Session,
+    email: str,
+    password: str,
+    role: str = "viewer",
+    created_by: str | None = None,
+) -> UserRecord:
     user = UserRecord(
         id=str(uuid4()),
         email=normalize_email(email),
@@ -136,6 +151,18 @@ def _create_user(db: Session, email: str, password: str, role: str = "viewer") -
         is_active=True,
     )
     db.add(user)
+    add_audit(
+        db,
+        "user_created",
+        f"user:{user.id}",
+        created_by or user.email,
+        {
+            "user_id": user.id,
+            "email": user.email,
+            "role": user.role,
+            "provisioned_by": created_by or "self_registration",
+        },
+    )
     try:
         db.commit()
     except IntegrityError:
@@ -153,9 +180,12 @@ def register(payload: RegisterRequest, db: Session = Depends(get_db)):
 
 @app.post("/api/auth/login")
 def login(
+    response: Response,
     form_data: OAuth2PasswordRequestForm = Depends(),
     db: Session = Depends(get_db),
 ):
+    response.headers["Cache-Control"] = "no-store"
+    response.headers["Pragma"] = "no-cache"
     email = normalize_email(form_data.username)
     user = db.scalar(select(UserRecord).where(UserRecord.email == email))
     if user is None or not user.is_active or not verify_password(form_data.password, user.password_hash):
@@ -180,10 +210,15 @@ def who_am_i(current_user: UserRecord = Depends(get_current_user)):
 @app.post("/api/auth/admin/users", status_code=status.HTTP_201_CREATED)
 def create_user_as_admin(
     payload: AdminUserCreate,
-    _: UserRecord = Depends(require_roles("admin")),
+    current_user: UserRecord = Depends(require_roles("admin")),
     db: Session = Depends(get_db),
 ):
-    return _public_user(_create_user(db, payload.email, payload.password, payload.role))
+    return _public_user(
+        _create_user(
+            db, payload.email, payload.password, payload.role,
+            created_by=current_user.email,
+        )
+    )
 
 
 @app.get("/api/health")
@@ -251,7 +286,7 @@ def score_one(payload: ScoreRequest, current_user: UserRecord = Depends(get_curr
 async def score_batch(file: UploadFile = File(...), current_user: UserRecord = Depends(get_current_user), db: Session = Depends(get_db)):
     if not file.filename or not file.filename.lower().endswith(".csv"):
         raise HTTPException(status_code=400, detail="Upload a .csv file")
-    raw = await file.read()
+    raw = await file.read(2_000_001)
     if len(raw) > 2_000_000:
         raise HTTPException(status_code=413, detail="CSV must be no larger than 2 MB")
     try:
