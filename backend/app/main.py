@@ -356,7 +356,10 @@ def review_transaction(
     current_user: UserRecord = Depends(require_roles("admin", "analyst")),
     db: Session = Depends(get_db),
 ):
-    row = db.get(TransactionRecord, transaction_id)
+    row = db.scalar(select(TransactionRecord).where(
+        TransactionRecord.id == transaction_id,
+        TransactionRecord.tenant_id == current_user.tenant_id,
+    ))
     if row is None:
         raise HTTPException(status_code=404, detail="Transaction not found")
     old_status = row.review_status
