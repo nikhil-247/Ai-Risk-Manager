@@ -11,7 +11,8 @@ from sqlalchemy.pool import StaticPool
 
 from backend.app.auth import bootstrap_admin, create_access_token, hash_password
 from backend.app.database import Base, get_db
-from backend.app.models import UserRecord
+from backend.app.models import TenantRecord, UserRecord
+from backend.app.tenancy import DEFAULT_TENANT_ID, DEFAULT_TENANT_NAME
 from backend.app.main import app
 from backend.app.seed import seed_demo_data
 
@@ -26,20 +27,26 @@ def client():
     TestingSessionLocal = sessionmaker(bind=engine, autoflush=False, expire_on_commit=False)
     Base.metadata.create_all(bind=engine)
     with sessionmaker(bind=engine, autoflush=False, expire_on_commit=False)() as db:
+        db.add(TenantRecord(id=DEFAULT_TENANT_ID, name=DEFAULT_TENANT_NAME))
+        db.flush()
         db.add_all([
             UserRecord(
+                tenant_id=DEFAULT_TENANT_ID,
                 id="test-admin-id", email="admin@example.com",
                 password_hash=hash_password("test-admin-password-123!"), role="admin", is_active=True,
             ),
             UserRecord(
+                tenant_id=DEFAULT_TENANT_ID,
                 id="test-analyst-id", email="analyst@example.com",
                 password_hash=hash_password("test-analyst-password-123!"), role="analyst", is_active=True,
             ),
             UserRecord(
+                tenant_id=DEFAULT_TENANT_ID,
                 id="test-viewer-id", email="viewer@example.com",
                 password_hash=hash_password("test-viewer-password-123!"), role="viewer", is_active=True,
             ),
             UserRecord(
+                tenant_id=DEFAULT_TENANT_ID,
                 id="test-disabled-id", email="disabled@example.com",
                 password_hash=hash_password("disabled-user-password-123!"), role="analyst", is_active=False,
             ),
