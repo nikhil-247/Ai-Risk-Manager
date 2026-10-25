@@ -14,6 +14,7 @@ from sqlalchemy.orm import Session
 
 from backend.app.database import get_db
 from backend.app.models import UserRecord
+from backend.app.tenancy import DEFAULT_TENANT_ID, ensure_default_tenant
 
 JWT_ALGORITHM = "HS256"
 RISKLENS_ENV = os.getenv("RISKLENS_ENV", "development").strip().lower()
@@ -115,16 +116,26 @@ def bootstrap_admin(db: Session) -> None:
         raise RuntimeError("Bootstrap admin password must be at least 12 characters")
     if email.count("@") != 1 or "." not in email.rsplit("@", 1)[-1]:
         raise RuntimeError("RISKLENS_BOOTSTRAP_ADMIN_EMAIL must be a valid email address")
+    ensure_default_tenant(db)
     existing = db.scalar(select(UserRecord).where(UserRecord.email == email))
     if existing is not None:
-        if existing.role != "admin":
+        if (
+            existing.role != "admin"
+            or existing.tenant_id != DEFAULT_TENANT_ID
+            or not existing.is_active
+        ):
             raise RuntimeError(
-                "Bootstrap email already belongs to a non-admin account. "
-                "Choose a different bootstrap email; roles are never auto-promoted."
+                "Bootstrap email is already used by a non-default workspace, "
+                "a non-admin role, or a disabled account. Choose a clean admin "
+                "email; bootstrap never changes an existing account."
             )
         return
     db.add(UserRecord(
-        id=str(uuid4()), email=email, password_hash=hash_password(password),
-        role="admin", is_active=True,
+        id=str(uuid4()),
+        tenant_id=DEFAULT_TENANT_ID,
+        email=email,
+        password_hash=hash_password(password),
+        role="admin",
+        is_active=True,
     ))
     db.commit()
