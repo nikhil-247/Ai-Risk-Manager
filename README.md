@@ -17,6 +17,7 @@ RiskLens AI is a full-stack transaction-risk decision-support application with a
 - CSV batch scoring with validation and downloadable output.
 - Audit trail for review actions and policy updates.
 - FastAPI OpenAPI / Swagger documentation.
+- Argon2 password hashing, expiring JWT access tokens, and server-enforced admin/analyst/viewer roles.
 - SQLite for local development; PostgreSQL in Docker Compose.
 - GitHub Actions jobs for backend/ML tests and frontend production compilation.
 
@@ -75,6 +76,9 @@ py -3.11 -m venv .venv
 .\.venv\Scripts\Activate.ps1
 python -m pip install --upgrade pip
 pip install -r backend/requirements.txt
+$env:RISKLENS_JWT_SECRET = [Convert]::ToBase64String([Security.Cryptography.RandomNumberGenerator]::GetBytes(48))
+$env:RISKLENS_BOOTSTRAP_ADMIN_EMAIL = "admin@example.com"
+$env:RISKLENS_BOOTSTRAP_ADMIN_PASSWORD = "replace-with-a-strong-password"
 alembic -c backend/alembic.ini upgrade head
 uvicorn backend.app.main:app --reload --port 8000
 ```
@@ -86,6 +90,10 @@ python3.11 -m venv .venv
 source .venv/bin/activate
 python -m pip install --upgrade pip
 pip install -r backend/requirements.txt
+export RISKLENS_JWT_SECRET="$(python -c 'import secrets; print(secrets.token_urlsafe(48))')"
+export RISKLENS_BOOTSTRAP_ADMIN_EMAIL="admin@example.com"
+export RISKLENS_BOOTSTRAP_ADMIN_PASSWORD="replace-with-a-strong-password"
+alembic -c backend/alembic.ini upgrade head
 uvicorn backend.app.main:app --reload --port 8000
 ```
 
@@ -129,7 +137,7 @@ docker compose up --build
 - Swagger docs: http://localhost:8000/docs
 - Health check: http://localhost:8000/api/health
 
-Compose stores database data in a named volume. The Compose password fallback is for local development only. Set `POSTGRES_PASSWORD` in a local ignored `.env` file before sharing or exposing the services. This MVP is not hardened for public production deployment.
+Compose stores database data in a named volume. For local demo sign-in, add `RISKLENS_JWT_SECRET`, `RISKLENS_BOOTSTRAP_ADMIN_EMAIL`, and `RISKLENS_BOOTSTRAP_ADMIN_PASSWORD` to a local ignored `.env` file before starting Compose. The bootstrap password must contain at least 12 characters. Without bootstrap credentials, users can register as read-only viewers; an admin can create analyst/admin accounts through `POST /api/auth/admin/users`. Use a long random JWT secret and strong PostgreSQL credentials outside local development. This MVP is not hardened for public production deployment.
 
 ## Public benchmark setup
 
@@ -171,19 +179,26 @@ Cost values are illustrative user-provided units until a merchant supplies appro
 | Method | Endpoint | Function |
 |---|---|---|
 | GET | `/api/health` | API and database readiness |
-| GET | `/api/summary` | Dashboard summary |
+| POST | `/api/auth/register` | Register a read-only viewer account |
+| POST | `/api/auth/login` | Get an expiring bearer access token (OAuth2 form: username=email) |
+| GET | `/api/auth/me` | Current user and role |
+| POST | `/api/auth/admin/users` | Admin-only account provisioning with explicit role |
+| GET | `/api/summary` | Authenticated dashboard summary |
 | GET | `/api/transactions` | Search/filter transactions |
 | GET | `/api/transactions/{id}` | Transaction detail |
 | POST | `/api/transactions/score` | Transparent demo score |
 | POST | `/api/transactions/batch` | Validate and score CSV rows |
-| POST | `/api/reviews/{id}` | Save a human review decision |
-| GET / PUT | `/api/policies` | Read/update score thresholds |
+| POST | `/api/reviews/{id}` | Analyst/admin only: save a human review decision |
+| GET / PUT | `/api/policies` | Read authenticated; admin-only updates |
 | GET | `/api/audit` | View persisted audit events |
 | GET | `/api/evaluation` | Benchmark report if generated, otherwise demo disclaimer |
 
 ## Security and data honesty
 
-- No authentication or tenant separation is implemented yet. Do not expose this deployment publicly with real data.
+- API authentication uses Argon2 password hashes and expiring HS256 bearer tokens. Set a strong, random `RISKLENS_JWT_SECRET`; the built-in fallback is for local development only.
+- Public registration creates viewer accounts only. Configure both `RISKLENS_BOOTSTRAP_ADMIN_EMAIL` and `RISKLENS_BOOTSTRAP_ADMIN_PASSWORD` to seed the first admin, or leave both unset. Admins can provision analyst/viewer/admin accounts through the protected admin endpoint.
+- Dashboard data endpoints require authentication. Analysts and admins can submit review decisions and read audit logs; only admins can change policies or provision users. These are API-enforced permissions, not just hidden UI controls.
+- Tenant separation is not implemented yet. Do not expose this deployment publicly with real multi-customer data.
 - Use synthetic or approved anonymized data only.
 - Local Docker default credentials are not production secrets.
 - Audit events persist, but are not cryptographically tamper-evident.
@@ -194,7 +209,7 @@ Cost values are illustrative user-provided units until a merchant supplies appro
 ## Roadmap
 
 1. Alembic migrations now manage schema changes; keep migrations versioned and reviewed.
-2. Add real authentication, RBAC and tenant boundaries.
+2. Add tenant boundaries and tenant-scoped queries/tests.
 3. Validate a merchant-like model feature schema and integrate inference only after testing.
 4. Add model versioning, threshold approvals, drift detection and alerting.
 5. Deploy with secrets management, observability, rate limits and security review.
