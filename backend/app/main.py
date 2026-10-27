@@ -435,28 +435,36 @@ def confirm_password_reset(
 ):
     enforce_rate_limit(request, "password_reset_confirm", 10, 900)
     token_hash = hashlib.sha256(payload.token.encode("utf-8")).hexdigest()
-    reset = db.get(PasswordResetTokenRecord, token_hash)
     now = datetime.now(timezone.utc)
-    if reset is None or reset.used_at is not None:
+    consumed = db.execute(
+        update(PasswordResetTokenRecord)
+        .where(
+            PasswordResetTokenRecord.token_hash == token_hash,
+            PasswordResetTokenRecord.used_at.is_(None),
+            PasswordResetTokenRecord.expires_at > now,
+        )
+        .values(used_at=now)
+        .execution_options(synchronize_session=False)
+    )
+    if consumed.rowcount != 1:
         raise HTTPException(status_code=400, detail="Reset link is invalid or expired")
-    expiry = reset.expires_at
-    if expiry.tzinfo is None:
-        expiry = expiry.replace(tzinfo=timezone.utc)
-    if expiry <= now:
+    reset = db.get(PasswordResetTokenRecord, token_hash)
+    if reset is None:
         raise HTTPException(status_code=400, detail="Reset link is invalid or expired")
     user = db.get(UserRecord, reset.user_id)
     if user is None or not user.is_active or user.tenant_id != reset.tenant_id:
         raise HTTPException(status_code=400, detail="Reset link is invalid or expired")
 
     user.password_hash = hash_password(payload.new_password)
-    reset.used_at = now
     db.execute(
         update(PasswordResetTokenRecord)
         .where(
             PasswordResetTokenRecord.user_id == user.id,
+            PasswordResetTokenRecord.token_hash != token_hash,
             PasswordResetTokenRecord.used_at.is_(None),
         )
         .values(used_at=now)
+        .execution_options(synchronize_session=False)
     )
     db.execute(
         update(UserSessionRecord)
@@ -554,16 +562,23 @@ def accept_invitation(
 ):
     enforce_rate_limit(request, "invitation_accept", 10, 900)
     token_hash = hashlib.sha256(payload.token.encode("utf-8")).hexdigest()
+    now = datetime.now(timezone.utc)
+    consumed = db.execute(
+        update(TenantInvitationRecord)
+        .where(
+            TenantInvitationRecord.token_hash == token_hash,
+            TenantInvitationRecord.accepted_at.is_(None),
+            TenantInvitationRecord.expires_at > now,
+        )
+        .values(accepted_at=now)
+        .execution_options(synchronize_session=False)
+    )
+    if consumed.rowcount != 1:
+        raise HTTPException(status_code=400, detail="Invitation is invalid or expired")
     invitation = db.scalar(
         select(TenantInvitationRecord).where(TenantInvitationRecord.token_hash == token_hash)
     )
-    now = datetime.now(timezone.utc)
-    if invitation is None or invitation.accepted_at is not None:
-        raise HTTPException(status_code=400, detail="Invitation is invalid or expired")
-    expiry = invitation.expires_at
-    if expiry.tzinfo is None:
-        expiry = expiry.replace(tzinfo=timezone.utc)
-    if expiry <= now:
+    if invitation is None:
         raise HTTPException(status_code=400, detail="Invitation is invalid or expired")
     if db.scalar(select(UserRecord.id).where(UserRecord.email == invitation.invited_email)):
         raise HTTPException(status_code=409, detail="This email already has an account")
@@ -576,7 +591,6 @@ def accept_invitation(
         role=invitation.role,
         is_active=True,
     )
-    invitation.accepted_at = now
     db.add(user)
     add_audit(
         db, invitation.tenant_id, "invitation_accepted", f"invitation:{invitation.id}",
