@@ -2,7 +2,7 @@ import { useEffect, useMemo, useState } from "react";
 import React from "react";
 import {
   Activity, AlertOctagon, ArrowUpRight, Bell, BrainCircuit, Check, ChevronDown,
-  CircleHelp, Clock3, Download, FileSearch, Filter, Gauge, LayoutDashboard, LogOut,
+  CircleHelp, Clock3, Copy, Download, FileSearch, Filter, Gauge, LayoutDashboard, LogOut,
   ListFilter, LockKeyhole, Menu, Search, ShieldAlert, ShieldCheck, Users, RefreshCw,
   SlidersHorizontal, Upload, X,
 } from "lucide-react";
@@ -526,6 +526,30 @@ export default function App() {
             {page === "model" && evaluation && <ModelPage evaluation={evaluation} scoringForm={scoringForm} setScoringForm={setScoringForm} runScore={runScore} singleScore={singleScore}/>}
             {page === "policies" && <section className="panel policy-panel"><div className="panel-heading"><div><h2>Risk routing thresholds</h2><p>Scores are demo rule points, not fraud probabilities.</p></div><span className="tag tag-amber">DEMO CONFIGURATION</span></div><div className="policy-scale"><div className="scale-segment safe-segment">LOW <span>0–{policyLow}</span></div><div className="scale-segment medium-segment">REVIEW <span>{policyLow + 1}–{policyReview}</span></div><div className="scale-segment high-segment">HIGH <span>{policyReview + 1}–100</span></div></div><div className="policy-controls"><label><span><strong>Low risk maximum</strong><small>Scores up to this value stay in the low-risk band.</small></span><input type="number" min={0} max={98} value={policyLow} onChange={(e) => setPolicyLow(Number(e.target.value))}/></label><label><span><strong>Manual review maximum</strong><small>Higher scores route to priority review.</small></span><input type="number" min={1} max={100} value={policyReview} onChange={(e) => setPolicyReview(Number(e.target.value))}/></label></div>{policyReview <= policyLow && <div className="inline-error">Review threshold must be greater than low-risk threshold.</div>}<div className="policy-footer"><p><LockKeyhole size={14}/> Changes are saved to the configured database. Thresholds are still illustrative demo rules.</p>{authUser.role === "admin" && <button disabled={policyReview <= policyLow || policyLow < 0 || policyReview > 100} className="btn btn-primary" onClick={() => void savePolicy()}>Save policy <Check size={15}/></button>}</div></section>}
 
+            {page === "team" && <section className="team-page">
+              <section className="panel">
+                <div className="panel-heading"><div><h2>Active sessions</h2><p>Tokens expire automatically. Revoke a session to immediately invalidate its access token.</p></div><button className="btn btn-secondary btn-small" onClick={() => void loadSessions()} disabled={teamBusy}><RefreshCw size={14}/> Refresh</button></div>
+                {sessions.length === 0 ? <div className="empty-state">No active sessions found. Sign in again to create a session.</div> : <div className="session-list">
+                  {sessions.map((session) => <div className="session-row" key={session.id}>
+                    <div className="session-mark"><KeyRound size={17}/></div>
+                    <div className="session-main"><strong>{session.current ? "This session" : "Signed-in session"} <span className={session.current ? "session-current" : "session-id"}>{session.current ? "CURRENT" : session.id.slice(0, 8)}</span></strong><small>Started {dateTime(session.created_at)} · Expires {dateTime(session.expires_at)}</small><small>{session.ip_address || "IP unavailable"} · {(session.user_agent || "Unknown browser").slice(0, 110)}</small></div>
+                    <button className="btn btn-secondary btn-small" disabled={teamBusy || session.current} onClick={() => void revokeSession(session.id)}>{session.current ? "Current" : "Revoke"}</button>
+                  </div>)}
+                </div>}
+                <div className="team-footer"><p><LockKeyhole size={14}/> Revoking a session invalidates its token on the next API request.</p><button className="btn btn-danger" disabled={teamBusy} onClick={() => void signOutAllSessions()}>Sign out all sessions <LogOut size={14}/></button></div>
+              </section>
+              {authUser.role === "admin" ? <section className="panel invite-panel">
+                <div className="panel-heading"><div><h2>Invite a teammate</h2><p>Invite someone into this workspace with a specific role. Links expire after 72 hours.</p></div><span className="tag tag-blue">ADMIN</span></div>
+                <form className="invite-form" onSubmit={(event) => void createInvitation(event)}>
+                  <label>Email address<input type="email" value={inviteEmail} onChange={(event) => setInviteEmail(event.target.value)} required maxLength={320} placeholder="teammate@company.com"/></label>
+                  <label>Workspace role<select value={inviteRole} onChange={(event) => setInviteRole(event.target.value as "admin" | "analyst" | "viewer")}><option value="viewer">Viewer · read only</option><option value="analyst">Analyst · review and audit</option><option value="admin">Admin · manage workspace</option></select></label>
+                  <button className="btn btn-primary" type="submit" disabled={teamBusy || !inviteEmail.trim()}>{teamBusy ? "Working…" : "Create invitation"} <Users size={15}/></button>
+                </form>
+                {inviteUrl && <div className="invite-link-box"><div><strong>Development invitation link</strong><small>Email delivery is configured separately. This link is only returned by the API outside production.</small><a href={inviteUrl} target="_blank" rel="noreferrer">{inviteUrl}</a></div><button className="btn btn-secondary btn-small" onClick={() => { void navigator.clipboard.writeText(inviteUrl).then(() => setTeamNotice("Invitation link copied to clipboard.")).catch(() => setTeamError("Clipboard is unavailable. Copy the link above manually.")); }}><Copy size={14}/> Copy</button></div>}
+              </section> : <section className="panel invite-panel"><div className="panel-heading"><div><h2>Workspace invitations</h2><p>Only workspace admins can invite or assign roles to teammates.</p></div><span className="tag">READ ONLY</span></div></section>}
+              {teamNotice && <div className="auth-notice team-message" role="status">{teamNotice}</div>}
+              {teamError && <div className="auth-error team-message" role="alert">{teamError}</div>}
+            </section>}
             {page === "audit" && <section className="panel"><div className="panel-heading"><div><h2>Recent audit events</h2><p>Review and policy events recorded by the API during this process.</p></div><button className="btn btn-secondary btn-small" onClick={() => void loadAudit()}><Activity size={14}/> Refresh log</button></div>{auditRows.length === 0 ? <div className="empty-state">No events yet. Review a transaction or update a risk policy to create an audit event.</div> : <div className="audit-list">{auditRows.map((row) => <div className="audit-item" key={String(row.id)}><div className="audit-icon"><ShieldCheck size={16}/></div><div><strong>{String(row.event_type).replaceAll("_", " ")}</strong><span>Actor: {String(row.actor)} · Transaction: {String(row.transaction_id)}</span><small>{dateTime(String(row.timestamp))}</small><code>{JSON.stringify(row.details)}</code></div></div>)}</div>}</section>}
           </>}
         <footer className="page-footer"><span>RiskLens AI <span className="footer-dot">·</span> Transaction risk intelligence</span><span><span className="footer-status"/> API-backed demo <span className="footer-dot">·</span> Synthetic records only</span></footer>
