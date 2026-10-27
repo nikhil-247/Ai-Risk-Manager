@@ -301,6 +301,7 @@ def logout_all(
             UserSessionRecord.expires_at > now,
         )
         .values(revoked_at=now)
+        .execution_options(synchronize_session=False)
     )
     db.commit()
     return {"status": "signed_out_all", "revoked_sessions": result.rowcount or 0}
