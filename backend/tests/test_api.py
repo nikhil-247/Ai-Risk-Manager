@@ -563,3 +563,17 @@ def test_rate_limiter_returns_429_with_retry_after():
         enforce_rate_limit(request, bucket, 2, 60, identities=["test@example.com"])
     assert limited.value.status_code == 429
     assert int(limited.value.headers["Retry-After"]) >= 1
+
+
+def test_production_rate_limiter_rejects_plaintext_redis_url():
+    env = os.environ.copy()
+    env["RISKLENS_ENV"] = "production"
+    env["RISKLENS_JWT_SECRET"] = "a-production-only-random-secret-not-used-here"
+    env["RISKLENS_REDIS_URL"] = "redis://redis.example.test:6379/0"
+    result = subprocess.run(
+        [sys.executable, "-c", "import backend.app.security_controls"],
+        cwd=Path(__file__).resolve().parents[2],
+        env=env, capture_output=True, text=True, check=False,
+    )
+    assert result.returncode != 0
+    assert "TLS-protected rediss:// Redis URL" in result.stderr
