@@ -64,8 +64,9 @@ def client(monkeypatch):
     app.dependency_overrides[get_db] = override_get_db
     with TestingSessionLocal() as db:
         seed_demo_data(db)
+        admin_token = create_access_token("test-admin-id", db, DEFAULT_TENANT_ID)
     with TestClient(app) as test_client:
-        test_client.headers.update({"Authorization": f"Bearer {create_access_token('test-admin-id')}"})
+        test_client.headers.update({"Authorization": f"Bearer {admin_token}"})
         yield test_client
     app.dependency_overrides.clear()
     Base.metadata.drop_all(bind=engine)
@@ -284,7 +285,12 @@ def test_invalid_and_inactive_tokens_are_rejected(client):
     invalid = client.get("/api/summary")
     assert invalid.status_code == 401
 
-    disabled_token = create_access_token("test-disabled-id")
+    db_generator = app.dependency_overrides[get_db]()
+    test_db = next(db_generator)
+    try:
+        disabled_token = create_access_token("test-disabled-id", test_db, DEFAULT_TENANT_ID)
+    finally:
+        db_generator.close()
     client.headers.update({"Authorization": f"Bearer {disabled_token}"})
     disabled = client.get("/api/summary")
     assert disabled.status_code == 401
