@@ -82,18 +82,71 @@ function ScoreRing({ score }: { score: number }) {
   </div>;
 }
 
+type AuthMode = "login" | "register" | "forgot" | "reset" | "invite";
+
 function AuthScreen({ onAuthenticated }: { onAuthenticated: (payload: AuthPayload) => void }) {
-  const [mode, setMode] = useState<"login" | "register">("login");
+  const query = new URLSearchParams(window.location.search);
+  const resetToken = query.get("reset_token") || "";
+  const invitationToken = query.get("invite_token") || "";
+  const [mode, setMode] = useState<AuthMode>(resetToken ? "reset" : invitationToken ? "invite" : "login");
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
+  const [actionToken] = useState(resetToken || invitationToken);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
+  const [notice, setNotice] = useState("");
+
+  function switchMode(next: AuthMode) {
+    setMode(next);
+    setPassword("");
+    setError("");
+    setNotice("");
+    if (next === "login" || next === "register" || next === "forgot") {
+      window.history.replaceState({}, "", window.location.pathname);
+    }
+  }
 
   async function submit(event: React.FormEvent<HTMLFormElement>) {
     event.preventDefault();
     setBusy(true);
     setError("");
+    setNotice("");
     try {
+      if (mode === "forgot") {
+        const response = await api<{ message: string }>("/api/auth/password-reset/request", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ email }),
+        });
+        setNotice(response.message);
+        return;
+      }
+      if (mode === "reset") {
+        await api("/api/auth/password-reset/confirm", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ token: actionToken, new_password: password }),
+        });
+        switchMode("login");
+        setNotice("Your password was changed. Sign in with your new password.");
+        return;
+      }
+      if (mode === "invite") {
+        const invited = await api<AuthUser>("/api/auth/invitations/accept", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ token: actionToken, password }),
+        });
+        setEmail(invited.email);
+        const loginPayload = await api<AuthPayload>("/api/auth/login", {
+          method: "POST",
+          headers: { "Content-Type": "application/x-www-form-urlencoded" },
+          body: new URLSearchParams({ username: invited.email, password }),
+        });
+        window.history.replaceState({}, "", window.location.pathname);
+        onAuthenticated(loginPayload);
+        return;
+      }
       if (mode === "register") {
         await api("/api/auth/register", {
           method: "POST",
@@ -108,23 +161,52 @@ function AuthScreen({ onAuthenticated }: { onAuthenticated: (payload: AuthPayloa
       });
       onAuthenticated(payload);
     } catch (reason) {
-      setError(reason instanceof Error ? reason.message : "Authentication failed");
+      setError(reason instanceof Error ? reason.message : "Request could not be completed");
     } finally {
       setBusy(false);
     }
   }
 
+  const title: Record<AuthMode, string> = {
+    login: "Welcome back.",
+    register: "Create your workspace.",
+    forgot: "Reset your password.",
+    reset: "Choose a new password.",
+    invite: "Join your workspace.",
+  };
+  const description: Record<AuthMode, string> = {
+    login: "Sign in to investigate risk and review transaction activity.",
+    register: "Start a separate workspace. You will be its administrator.",
+    forgot: "Enter your account email. If it exists, we will send a one-time recovery link.",
+    reset: "Choose a strong password. This link expires after 30 minutes and can only be used once.",
+    invite: "Choose a password to accept your workspace invitation.",
+  };
+  const needsEmail = mode === "login" || mode === "register" || mode === "forgot";
+  const needsPassword = mode !== "forgot";
+
   return <div className="auth-screen">
     <form className="auth-card" onSubmit={(event) => void submit(event)}>
       <div className="auth-brand"><div className="brand-mark"><ShieldCheck size={22}/></div><div><strong>risklens<span> AI</span></strong><small>RISK INTELLIGENCE</small></div></div>
       <span className="auth-eyebrow">SECURE WORKSPACE</span>
-      <h1>{mode === "login" ? "Welcome back." : "Create your account."}</h1>
-      <p>{mode === "login" ? "Sign in to investigate risk and review transaction activity." : "New registrations start with read-only viewer access."}</p>
-      <label>Email address<input autoComplete="email" type="email" value={email} onChange={(event) => setEmail(event.target.value)} required maxLength={320} placeholder="you@company.com"/></label>
-      <label>Password<input autoComplete={mode === "login" ? "current-password" : "new-password"} type="password" value={password} onChange={(event) => setPassword(event.target.value)} required minLength={12} maxLength={128} placeholder="At least 12 characters"/></label>
+      <h1>{title[mode]}</h1>
+      <p>{description[mode]}</p>
+      {needsEmail && <label>Email address<input autoComplete="email" type="email" value={email} onChange={(event) => setEmail(event.target.value)} required maxLength={320} placeholder="you@company.com"/></label>}
+      {needsPassword && <label>{mode === "login" ? "Password" : "Password (12+ characters)"}<input autoComplete={mode === "login" ? "current-password" : "new-password"} type="password" value={password} onChange={(event) => setPassword(event.target.value)} required minLength={12} maxLength={128} placeholder="At least 12 characters"/></label>}
+      {mode === "invite" && <div className="auth-info">Invitation links are one-time and expire after 72 hours.</div>}
+      {notice && <div className="auth-notice" role="status">{notice}</div>}
       {error && <div className="auth-error" role="alert">{error}</div>}
-      <button className="btn btn-primary auth-submit" type="submit" disabled={busy}>{busy ? "Please wait…" : mode === "login" ? "Sign in securely" : "Create viewer account"}</button>
-      <button className="auth-switch" type="button" onClick={() => { setMode(mode === "login" ? "register" : "login"); setError(""); }}>{mode === "login" ? "Need an account? Register" : "Already registered? Sign in"}</button>
+      <button className="btn btn-primary auth-submit" type="submit" disabled={busy || ((mode === "reset" || mode === "invite") && !actionToken)}>{busy ? "Please wait…" : ({
+        login: "Sign in securely",
+        register: "Create workspace",
+        forgot: "Send recovery instructions",
+        reset: "Update password",
+        invite: "Accept invitation",
+      } as Record<AuthMode, string>)[mode]}</button>
+      <div className="auth-switch-row">
+        {mode === "login" && <button className="auth-switch" type="button" onClick={() => switchMode("forgot")}>Forgot password?</button>}
+        {mode === "login" && <button className="auth-switch" type="button" onClick={() => switchMode("register")}>Create a workspace</button>}
+        {(mode === "register" || mode === "forgot" || mode === "reset" || mode === "invite") && <button className="auth-switch" type="button" onClick={() => switchMode("login")}>Back to sign in</button>}
+      </div>
       <small className="auth-footnote">Demo risk scores are decision-support signals, not live payment decisions.</small>
     </form>
   </div>;
