@@ -34,6 +34,12 @@ A lower-cost quick iteration can use `--trees 30`, while the default is 120 tree
 
 Threshold costs default to 5 units for each false positive and 100 units for each false negative. These are example assumptions, not externally validated financial costs. Supply merchant-approved assumptions for meaningful cost analysis. Dataset amounts and labels are not a substitute for real-world prospective validation.
 
-The benchmark uses anonymized PCA features and does not provide the merchant-specific account-age, location-risk or velocity features in the interactive demo form. The benchmark model is therefore an offline evaluation artifact in this phase; the dashboard's custom transaction scorer remains a separately labelled demo rules engine. Do not imply the trained benchmark model scores the demo form.
+The benchmark uses anonymized PCA features and does not provide the merchant-specific account-age, location-risk or velocity features in the interactive demo form. The benchmark model is therefore an offline evaluation artifact; the dashboard's custom transaction scorer remains a separately labelled demo rules engine. Do not imply the trained benchmark model scores the demo form.
+
+## Production scoring gate
+
+When `RISKLENS_ENV=production`, the API intentionally returns HTTP 503 from heuristic single-score and batch-score endpoints and blocks policy updates that would recompute stored scores with the heuristic. Production startup also skips demo seeding and refuses to start if the known synthetic fixture transaction IDs are present in the database. This prevents the sample scorer and seeded records from silently being presented as live risk infrastructure.
+
+This gate does not activate the offline benchmark model. Before a production scorer can be implemented, the operator needs an approved merchant feature contract and mapping, leakage-safe training/validation, prospective shadow evaluation against real outcomes, approved false-positive/false-negative tradeoffs, calibration and drift monitoring, rollback controls, and independent security/privacy review. Until then, the system is decision-support/demo only; it must not authorize, decline, or route real payments.
 
 Synthetic sample transactions and their displayed status labels are interface fixtures. Never combine them with benchmark results or claim that they establish real fraud model quality.
