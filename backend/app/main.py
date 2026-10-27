@@ -31,7 +31,7 @@ from backend.app.models import (
     TenantRecord, TransactionRecord, UserRecord, UserSessionRecord,
 )
 from backend.app.risk_scoring import ScoreRequest, score_features
-from backend.app.seed import seed_demo_data
+from backend.app.seed import DEMO_ROWS, seed_demo_data
 from backend.app.messaging import create_action_url, send_security_email
 from backend.app.security_controls import enforce_rate_limit
 
@@ -41,11 +41,49 @@ async def lifespan(_: FastAPI):
     from backend.app.database import SessionLocal
     with SessionLocal() as db:
         bootstrap_admin(db)
-        seed_demo_data(db)
+        if _is_production_environment():
+            _ensure_no_demo_fixture_rows(db)
+        else:
+            seed_demo_data(db)
     yield
 
 
 logger = logging.getLogger("risklens.auth")
+
+
+def _is_production_environment() -> bool:
+    return os.getenv("RISKLENS_ENV", "development").strip().lower() == "production"
+
+
+def _ensure_no_demo_fixture_rows(db: Session) -> None:
+    """Prevent known synthetic fixture transactions from being served in production."""
+    demo_ids = [row[0] for row in DEMO_ROWS]
+    count = int(
+        db.scalar(
+            select(func.count())
+            .select_from(TransactionRecord)
+            .where(TransactionRecord.id.in_(demo_ids))
+        ) or 0
+    )
+    if count:
+        raise RuntimeError(
+            "Production startup blocked: synthetic demo fixture transactions exist in the database. "
+            "Use a clean production database or explicitly remove the known demo fixtures before startup."
+        )
+
+
+def _guard_heuristic_scoring() -> None:
+    """Fail closed because the demo heuristic is not a validated production scorer."""
+    if _is_production_environment():
+        raise HTTPException(
+            status_code=503,
+            detail=(
+                "Heuristic scoring is disabled in production. A merchant-specific feature adapter, "
+                "prospective validation, calibrated thresholds, and explicit model approval are required "
+                "before production scoring can be enabled."
+            ),
+        )
+
 
 app = FastAPI(
     title="RiskLens AI API",
@@ -613,6 +651,21 @@ def health(db: Session = Depends(get_db)):
     return {"status": "ok", "service": "risklens-ai-api", "version": app.version, "database": "reachable"}
 
 
+@app.get("/api/scoring/status")
+def scoring_status():
+    production = _is_production_environment()
+    return {
+        "mode": "disabled_in_production" if production else "heuristic_demo",
+        "production_scoring_ready": False,
+        "real_payment_decisions_enabled": False,
+        "blockers": [
+            "The online scorer is a transparent demo heuristic, not the offline trained benchmark model.",
+            "The benchmark uses Time/V1-V28/Amount features and has no validated adapter to merchant transaction fields.",
+            "Merchant-specific prospective validation, calibrated thresholds, monitoring, and model approval are not configured.",
+        ],
+    }
+
+
 @app.get("/api/summary")
 def summary(current_user: UserRecord = Depends(get_current_user), db: Session = Depends(get_db)):
     rows = list(db.scalars(
@@ -668,12 +721,14 @@ def transaction_detail(transaction_id: str, current_user: UserRecord = Depends(g
 
 @app.post("/api/transactions/score")
 def score_one(payload: ScoreRequest, current_user: UserRecord = Depends(get_current_user), db: Session = Depends(get_db)):
+    _guard_heuristic_scoring()
     policy = policy_for(db, current_user.tenant_id)
     return score_features(payload, policy.low_max, policy.review_max)
 
 
 @app.post("/api/transactions/batch")
 async def score_batch(file: UploadFile = File(...), current_user: UserRecord = Depends(get_current_user), db: Session = Depends(get_db)):
+    _guard_heuristic_scoring()
     if not file.filename or not file.filename.lower().endswith(".csv"):
         raise HTTPException(status_code=400, detail="Upload a .csv file")
     raw = await file.read(2_000_001)
@@ -750,6 +805,7 @@ def update_policy(
     current_user: UserRecord = Depends(require_roles("admin")),
     db: Session = Depends(get_db),
 ):
+    _guard_heuristic_scoring()
     policy = policy_for(db, current_user.tenant_id)
     policy.low_max = payload.low_max
     policy.review_max = payload.review_max
