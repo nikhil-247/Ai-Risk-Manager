@@ -13,6 +13,8 @@ RISKLENS_ENV = os.getenv("RISKLENS_ENV", "development").strip().lower()
 REDIS_URL = os.getenv("RISKLENS_REDIS_URL", "").strip()
 if RISKLENS_ENV == "production" and not REDIS_URL:
     raise RuntimeError("RISKLENS_REDIS_URL is required for production rate limiting")
+if RISKLENS_ENV == "production" and not REDIS_URL.lower().startswith("rediss://"):
+    raise RuntimeError("Production rate limiting requires a TLS-protected rediss:// Redis URL")
 
 _redis = None
 if REDIS_URL:
