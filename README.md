@@ -21,6 +21,7 @@ RiskLens AI is a full-stack transaction-risk decision-support application with a
 - Redis-backed login, registration, recovery and invitation rate limits (local-process fallback for development only).
 - Persistent session listing/revocation, sign-out-all, one-time password recovery, and tenant-scoped email invitations.
 - Workspace (tenant) isolation for transactions, risk policies, and audit events, with a tenant ID derived from the authenticated user.
+- Production-mode fail-closed guard: heuristic scoring and policy-driven rescoring are disabled, and startup rejects known synthetic demo fixture rows.
 - SQLite for local development; PostgreSQL in Docker Compose.
 - GitHub Actions jobs for backend/ML tests and frontend production compilation.
 
@@ -143,7 +144,7 @@ Compose runs PostgreSQL, Redis, the API and frontend. It refuses to start unless
 3. Set `RISKLENS_BOOTSTRAP_ADMIN_EMAIL` and a unique `RISKLENS_BOOTSTRAP_ADMIN_PASSWORD` of at least 12 characters.
 4. Run `docker compose up --build`.
 
-The bootstrap admin is placed in the default `Northstar Payments` demo workspace, which contains the seeded sample transactions. The bootstrap email must not already belong to a different workspace or a non-admin/disabled account; the application never silently promotes an existing user. Public registration creates a separate isolated workspace and makes its first member that workspace's admin. Admins can provision users directly or create one-time invitations inside their own workspace. Local development logs recovery/invitation links when SMTP is not configured; production requires SMTP configuration and an HTTPS public app URL. For deployment, set `RISKLENS_ENV=production`, use HTTPS, configure `RISKLENS_REDIS_URL` to a shared Redis instance using `rediss://` TLS, and set `RISKLENS_CORS_ORIGINS` to exact trusted frontend origins. This MVP still needs a deployment-specific security review before handling real customer data.
+The bootstrap admin is placed in the default `Northstar Payments` demo workspace, which contains the seeded sample transactions. The bootstrap email must not already belong to a different workspace or a non-admin/disabled account; the application never silently promotes an existing user. Public registration creates a separate isolated workspace and makes its first member that workspace's admin. Admins can provision users directly or create one-time invitations inside their own workspace. Local development logs recovery/invitation links when SMTP is not configured; production requires SMTP configuration and an HTTPS public app URL. For deployment, set `RISKLENS_ENV=production`, use HTTPS, configure `RISKLENS_REDIS_URL` to a shared Redis instance using `rediss://` TLS, and set `RISKLENS_CORS_ORIGINS` to exact trusted frontend origins. Production mode now fails closed for heuristic scoring, but that is a safety gate, not production readiness. The app still requires a merchant-specific feature adapter, prospective evaluation on approved data, documented threshold approval, monitoring/incident response, secrets and TLS configuration, and an independent deployment-specific security review before any real customer data or payment decision is in scope.
 
 ## Public benchmark setup
 
@@ -185,6 +186,7 @@ Cost values are illustrative user-provided units until a merchant supplies appro
 | Method | Endpoint | Function |
 |---|---|---|
 | GET | `/api/health` | API and database readiness |
+| GET | `/api/scoring/status` | Shows demo mode and blockers; never reports real-payment readiness |
 | POST | `/api/auth/register` | Create a new isolated workspace and its first admin |
 | POST | `/api/auth/logout` | Revoke the current access-token session |
 | POST | `/api/auth/logout-all` | Revoke all active sessions for the current user |
@@ -223,7 +225,9 @@ Cost values are illustrative user-provided units until a merchant supplies appro
 - Use synthetic or approved anonymized data only.
 - Local Docker default credentials are not production secrets.
 - Audit events persist, but are not cryptographically tamper-evident.
-- Heuristic points are not calibrated probabilities and never trigger real payment actions.
+- `RISKLENS_ENV=production` disables `POST /api/transactions/score`, `POST /api/transactions/batch`, and policy updates that would rescore rows with the demo heuristic. These paths return HTTP 503 until a validated production scorer is integrated.
+- Production startup does not create synthetic demo transactions and refuses to start if known seeded fixture IDs already exist. Use a clean production database; inspect and deliberately remove demo fixtures during migration rather than mixing them with real records.
+- Heuristic points are not calibrated probabilities and never trigger real payment actions. The offline benchmark model is not connected to the online API because its anonymized feature schema does not match merchant-style input fields.
 - The public benchmark's anonymized features do not support the merchant-style online form without a separate, validated feature adapter.
 - Raw dataset, SQLite database, model artifacts and `.env` are ignored by Git.
 

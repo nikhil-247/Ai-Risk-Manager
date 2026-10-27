@@ -17,7 +17,7 @@ from backend.app.auth import bootstrap_admin, create_access_token, hash_password
 from backend.app.database import Base, get_db
 from backend.app.models import TenantRecord, UserRecord
 from backend.app.tenancy import DEFAULT_TENANT_ID, DEFAULT_TENANT_NAME
-from backend.app.main import app
+from backend.app.main import app, _ensure_no_demo_fixture_rows
 from backend.app.seed import seed_demo_data
 from backend.app.security_controls import enforce_rate_limit
 
@@ -117,6 +117,44 @@ def test_scoring_returns_explanation_and_disclaimer(client):
     assert payload["risk_category"] == "high"
     assert payload["reasons"]
     assert "not a calibrated" in payload["disclaimer"]
+
+
+def test_production_mode_fails_closed_for_heuristic_scoring(client, monkeypatch):
+    monkeypatch.setenv("RISKLENS_ENV", "development")
+    dev_status = client.get("/api/scoring/status")
+    assert dev_status.status_code == 200
+    assert dev_status.json()["mode"] == "heuristic_demo"
+    assert dev_status.json()["production_scoring_ready"] is False
+    assert dev_status.json()["real_payment_decisions_enabled"] is False
+
+    monkeypatch.setenv("RISKLENS_ENV", "production")
+    status = client.get("/api/scoring/status")
+    assert status.status_code == 200
+    assert status.json()["mode"] == "disabled_in_production"
+
+    score = client.post("/api/transactions/score", json={"amount": 1000})
+    assert score.status_code == 503
+    assert "disabled in production" in score.json()["detail"].lower()
+
+    batch = client.post(
+        "/api/transactions/batch",
+        files={"file": ("transactions.csv", b"amount\n1000\n", "text/csv")},
+    )
+    assert batch.status_code == 503
+
+    policy = client.put("/api/policies", json={"low_max": 20, "review_max": 50})
+    assert policy.status_code == 503
+    assert client.get("/api/policies").json()["low_max"] == 29
+
+
+def test_production_startup_rejects_synthetic_demo_fixture_rows(client):
+    db_generator = app.dependency_overrides[get_db]()
+    test_db = next(db_generator)
+    try:
+        with pytest.raises(RuntimeError, match="synthetic demo fixture transactions"):
+            _ensure_no_demo_fixture_rows(test_db)
+    finally:
+        db_generator.close()
 
 
 def test_review_decision_is_persisted_and_audited(client):
