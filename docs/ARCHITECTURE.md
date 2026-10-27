@@ -31,11 +31,11 @@ Migration `0003_tenant_isolation` creates the default demo tenant and backfills 
 
 - Passwords are stored as Argon2 hashes, never returned through the API. JWTs require issuer, audience, issue/expiry claims and a matching persisted session. Revoked/expired sessions fail authorization even if a signed token has not reached its original expiration.
 - Password reset responses do not reveal whether an email exists. Tokens are single-use, hashed at rest, short-lived and invalidated after use. Password resets revoke the account's active sessions.
-- Login, registration, recovery and invitation endpoints are rate-limited. Production expects shared Redis; if Redis becomes unavailable, protected rate-limited operations fail closed with 503 rather than silently bypassing the limit.
+- Login, registration, recovery and invitation endpoints are rate-limited. Production requires shared TLS-protected Redis (`rediss://`); if Redis becomes unavailable, protected rate-limited operations fail closed with 503 rather than silently bypassing the limit.
 - API endpoints enforce roles server-side. The frontend role-aware controls are usability features, not the security boundary.
 - Tenant identifiers are taken from the authenticated user record and applied directly to transaction, policy and audit queries. Transaction detail and review routes return not found for IDs outside the caller's workspace.
 - Access tokens are held in browser local storage for this MVP, which remains exposed to successful same-origin script injection. Production deployment needs a reviewed CSP, HTTPS-only ingress, dependency review and appropriate browser-security controls.
-- Local-process rate limiting is for development only and is not shared among multiple workers. Configure Redis for deployments.
+- Local-process rate limiting is for development only and is not shared among multiple workers. Production requires a shared Redis URL using `rediss://`.
 - SMTP credentials and Redis connections must be secured; production must use a verified HTTPS public app URL for recovery/invitation links.
 - Audit rows are durable, but are not cryptographically tamper-evident against a database administrator.
 - The demo heuristic is not calibrated and does not connect to a payment processor.
