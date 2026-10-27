@@ -138,7 +138,7 @@ def test_production_mode_fails_closed_for_heuristic_scoring(client, monkeypatch)
 
     batch = client.post(
         "/api/transactions/batch",
-        files={"file": ("transactions.csv", b"amount\\n1000\\n", "text/csv")},
+        files={"file": ("transactions.csv", b"amount\n1000\n", "text/csv")},
     )
     assert batch.status_code == 503
 
