@@ -26,3 +26,34 @@
 .auth-error{padding:10px 12px;border:1px solid #f2d4d8;border-radius:7px;background:#fff2f3;color:#b84d59;font-size:10px;line-height:1.5}
 .auth-footnote{display:block;margin-top:26px;text-align:center;font-size:9px;color:#9aa4b3;line-height:1.6}
 @media(max-width:480px){.auth-card{padding:25px 20px}}
+
+/* Authentication recovery and workspace security */
+.auth-switch-row{display:flex;align-items:center;justify-content:center;flex-wrap:wrap;gap:18px;margin-top:12px}
+.auth-switch-row .auth-switch{margin:0}
+.auth-notice,.auth-info{padding:11px 12px;border:1px solid #d2e8dc;border-radius:8px;background:#f1fbf5;color:#286b48;font-size:10px;line-height:1.6;overflow-wrap:anywhere}
+.auth-info{border-color:#dce5f8;background:#f5f8ff;color:#56688b}
+.team-page{display:grid;grid-template-columns:1fr;gap:18px}
+.team-page .panel{min-width:0}
+.session-list{display:flex;flex-direction:column}
+.session-row{display:flex;align-items:center;gap:13px;padding:16px 0;border-bottom:1px solid #edf0f5}
+.session-row:last-child{border-bottom:0}
+.session-mark{width:38px;height:38px;border-radius:10px;background:#eef3ff;color:#6380dc;display:grid;place-items:center;flex:0 0 auto}
+.session-main{flex:1;min-width:0;display:flex;flex-direction:column;gap:5px}
+.session-main strong{color:#344158;font-size:11px;display:flex;align-items:center;gap:8px;flex-wrap:wrap}
+.session-main small{font-size:9px;line-height:1.5;color:#8c97a9;overflow-wrap:anywhere}
+.session-current,.session-id{font-size:8px;letter-spacing:.4px;font-weight:800;padding:4px 6px;border-radius:5px;background:#e7f7ed;color:#2e8350}
+.session-id{background:#f0f2f7;color:#7b879a}
+.team-footer{border-top:1px solid #edf0f5;margin-top:10px;padding-top:14px;display:flex;align-items:center;justify-content:space-between;gap:12px;flex-wrap:wrap}
+.team-footer p{display:flex;align-items:center;gap:7px;color:#8c97a9;font-size:10px;line-height:1.5;margin:0;flex:1}
+.invite-form{display:grid;grid-template-columns:minmax(0,1fr) minmax(160px,.7fr) auto;align-items:end;gap:12px}
+.invite-form label{display:flex;flex-direction:column;gap:7px;font-size:10px;font-weight:700;color:#5c6980}
+.invite-form input,.invite-form select{height:40px;min-width:0;width:100%;box-sizing:border-box;border:1px solid #e0e6f0;border-radius:8px;padding:0 11px;background:#fff;color:#354259;font:12px inherit;outline:none}
+.invite-form input:focus,.invite-form select:focus{border-color:#8da6f2;box-shadow:0 0 0 3px #5577e414}
+.invite-form .btn{height:40px;white-space:nowrap}
+.invite-link-box{margin-top:16px;padding:12px;border:1px solid #dce5f8;border-radius:9px;background:#f7f9ff;display:flex;align-items:center;justify-content:space-between;gap:15px}
+.invite-link-box>div{display:flex;flex-direction:column;gap:5px;min-width:0}
+.invite-link-box strong{font-size:10px;color:#3a4965}
+.invite-link-box small{font-size:9px;line-height:1.5;color:#7f8ca4}
+.invite-link-box a{font-size:10px;color:#5b75ce;overflow-wrap:anywhere}
+.team-message{margin-top:0}
+@media(max-width:760px){.invite-form{grid-template-columns:1fr}.invite-form .btn{width:100%;justify-content:center}.team-footer{align-items:stretch}.team-footer .btn{justify-content:center}.invite-link-box{align-items:flex-start;flex-direction:column}.session-row{align-items:flex-start}.session-row>.btn{margin-top:2px}}
