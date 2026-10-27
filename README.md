@@ -18,6 +18,8 @@ RiskLens AI is a full-stack transaction-risk decision-support application with a
 - Audit trail for review actions and policy updates.
 - FastAPI OpenAPI / Swagger documentation.
 - Argon2 password hashing, expiring JWT access tokens, and server-enforced admin/analyst/viewer roles.
+- Redis-backed login, registration, recovery and invitation rate limits (local-process fallback for development only).
+- Persistent session listing/revocation, sign-out-all, one-time password recovery, and tenant-scoped email invitations.
 - Workspace (tenant) isolation for transactions, risk policies, and audit events, with a tenant ID derived from the authenticated user.
 - SQLite for local development; PostgreSQL in Docker Compose.
 - GitHub Actions jobs for backend/ML tests and frontend production compilation.
@@ -134,14 +136,14 @@ npm run build
 - Swagger docs: http://localhost:8000/docs
 - Health check: http://localhost:8000/api/health
 
-Compose now refuses to start unless explicit database and JWT secrets are set.
+Compose runs PostgreSQL, Redis, the API and frontend. It refuses to start unless explicit database and JWT secrets are set. Redis shares rate-limit counters across API workers.
 
 1. Copy `.env.example` to `.env`.
 2. Fill `POSTGRES_PASSWORD` and `RISKLENS_JWT_SECRET` with different, long URL-safe random values. You can generate one with `python -c "import secrets; print(secrets.token_urlsafe(48))"`.
 3. Set `RISKLENS_BOOTSTRAP_ADMIN_EMAIL` and a unique `RISKLENS_BOOTSTRAP_ADMIN_PASSWORD` of at least 12 characters.
 4. Run `docker compose up --build`.
 
-The bootstrap admin is placed in the default `Northstar Payments` demo workspace, which contains the seeded sample transactions. The bootstrap email must not already belong to a different workspace or a non-admin/disabled account; the application never silently promotes an existing user. Public registration creates a new isolated workspace and makes its first member that workspace's admin. Admins can provision analyst/admin/viewer accounts inside their own workspace through `POST /api/auth/admin/users`. For deployment, set `RISKLENS_ENV=production`, use HTTPS, and set `RISKLENS_CORS_ORIGINS` to the exact comma-separated frontend origins. This MVP still needs a deployment-specific security review before handling real customer data.
+The bootstrap admin is placed in the default `Northstar Payments` demo workspace, which contains the seeded sample transactions. The bootstrap email must not already belong to a different workspace or a non-admin/disabled account; the application never silently promotes an existing user. Public registration creates a separate isolated workspace and makes its first member that workspace's admin. Admins can provision users directly or create one-time invitations inside their own workspace. Local development logs recovery/invitation links when SMTP is not configured; production requires SMTP configuration and an HTTPS public app URL. For deployment, set `RISKLENS_ENV=production`, use HTTPS, configure `RISKLENS_REDIS_URL` to a shared Redis instance using `rediss://` TLS, and set `RISKLENS_CORS_ORIGINS` to exact trusted frontend origins. This MVP still needs a deployment-specific security review before handling real customer data.
 
 ## Public benchmark setup
 
@@ -184,6 +186,14 @@ Cost values are illustrative user-provided units until a merchant supplies appro
 |---|---|---|
 | GET | `/api/health` | API and database readiness |
 | POST | `/api/auth/register` | Create a new isolated workspace and its first admin |
+| POST | `/api/auth/logout` | Revoke the current access-token session |
+| POST | `/api/auth/logout-all` | Revoke all active sessions for the current user |
+| GET | `/api/auth/sessions` | List active sessions for the current user |
+| POST | `/api/auth/sessions/{id}/revoke` | Revoke one of the current user's sessions |
+| POST | `/api/auth/password-reset/request` | Request a generic, one-time password reset email |
+| POST | `/api/auth/password-reset/confirm` | Complete password reset and revoke existing sessions |
+| POST | `/api/auth/invitations` | Admin: invite a user into the current workspace |
+| POST | `/api/auth/invitations/accept` | Accept a one-time workspace invitation |
 | POST | `/api/auth/login` | Get an expiring bearer access token (OAuth2 form: username=email) |
 | GET | `/api/auth/me` | Current user and role |
 | POST | `/api/auth/admin/users` | Admin-only account provisioning with explicit role |
@@ -204,6 +214,10 @@ Cost values are illustrative user-provided units until a merchant supplies appro
 - Dashboard data endpoints require authentication. Analysts and admins can submit review decisions and read audit logs; only admins can change policies or provision users. Account creation is written to the audit trail, and reviewer identity comes from the authenticated account. These are API-enforced permissions, not just hidden UI controls.
 - CSV batch uploads are read with a 2 MB bound before parsing, and exported cell values are neutralized against spreadsheet-formula injection.
 - Login responses are marked `Cache-Control: no-store`; the frontend clears local session state when an API request returns an unauthorized response.
+- Access tokens have persisted server-side session IDs, so single-session logout, revocation of other devices and sign-out-all take effect before token expiry. Password resets revoke all active sessions.
+- Login, registration, password recovery and invitations are rate-limited. Docker Compose uses Redis so counters are shared across API processes; the in-memory fallback is only suitable for local development.
+- Password reset tokens are stored as SHA-256 hashes, expire after 30 minutes, are single-use, and never appear in the API response. Invitation tokens are stored as hashes, expire after 72 hours, and are single-use.
+- In production, configure `RISKLENS_SMTP_HOST`, `RISKLENS_SMTP_PORT`, optional `RISKLENS_SMTP_USERNAME`/`RISKLENS_SMTP_PASSWORD`, `RISKLENS_EMAIL_FROM`, and an HTTPS `RISKLENS_PUBLIC_APP_URL`. Without mail delivery configuration, production startup refuses to run.
 - Set `RISKLENS_CORS_ORIGINS` to exact trusted origins when hosting the frontend outside localhost. CORS is not a replacement for authentication or network-level controls.
 - Tenant IDs are attached to users, transactions, risk policies, and audit events. The API derives the tenant scope from the signed-in user, and the migration assigns pre-existing rows to the default demo workspace. Regression tests cover attempts to access another tenant's transaction and policy data.
 - Use synthetic or approved anonymized data only.
@@ -216,7 +230,7 @@ Cost values are illustrative user-provided units until a merchant supplies appro
 ## Roadmap
 
 1. Alembic migrations now manage schema changes; keep migrations versioned and reviewed.
-2. Tenant isolation and cross-tenant regression tests are implemented; add invitations, tenant administration, and account lifecycle controls next.
+2. Auth lifecycle foundations are implemented; add email verification, account deactivation, password-reset monitoring and invitations management next.
 3. Validate a merchant-like model feature schema and integrate inference only after testing.
 4. Add model versioning, threshold approvals, drift detection and alerting.
 5. Deploy with secrets management, observability, rate limits and security review.

@@ -13,7 +13,7 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from backend.app.database import get_db
-from backend.app.models import UserRecord
+from backend.app.models import UserRecord, UserSessionRecord
 from backend.app.tenancy import DEFAULT_TENANT_ID, ensure_default_tenant
 
 JWT_ALGORITHM = "HS256"
@@ -55,35 +55,95 @@ def verify_password(password: str, password_hash: str) -> bool:
         return False
 
 
-def create_access_token(subject: str) -> str:
+def create_access_token(
+    subject: str,
+    db: Session,
+    tenant_id: str,
+    ip_address: str | None = None,
+    user_agent: str | None = None,
+) -> str:
     now = datetime.now(timezone.utc)
+    expires_at = now + timedelta(minutes=ACCESS_TOKEN_MINUTES)
+    session_id = str(uuid4())
+    db.add(UserSessionRecord(
+        id=session_id,
+        user_id=subject,
+        tenant_id=tenant_id,
+        created_at=now,
+        expires_at=expires_at,
+        ip_address=(ip_address or "")[:64] or None,
+        user_agent=(user_agent or "")[:255] or None,
+    ))
+    db.commit()
     return jwt.encode(
-        {"sub": subject, "iat": now, "exp": now + timedelta(minutes=ACCESS_TOKEN_MINUTES)},
+        {
+            "sub": subject,
+            "jti": session_id,
+            "iat": now,
+            "nbf": now,
+            "exp": expires_at,
+            "iss": "risklens-ai",
+            "aud": "risklens-api",
+        },
         JWT_SECRET,
         algorithm=JWT_ALGORITHM,
     )
 
 
-def get_current_user(
+def get_current_session(
     token: str = Depends(oauth2_scheme),
     db: Session = Depends(get_db),
-) -> UserRecord:
+) -> UserSessionRecord:
     unauthorized = HTTPException(
         status_code=status.HTTP_401_UNAUTHORIZED,
-        detail="Invalid or expired access token",
+        detail="Invalid, expired, or revoked access token",
         headers={"WWW-Authenticate": "Bearer"},
     )
     try:
-        payload = jwt.decode(token, JWT_SECRET, algorithms=[JWT_ALGORITHM])
-        subject = payload.get("sub")
-        if not isinstance(subject, str) or not subject:
-            raise unauthorized
+        payload = jwt.decode(
+            token,
+            JWT_SECRET,
+            algorithms=[JWT_ALGORITHM],
+            issuer="risklens-ai",
+            audience="risklens-api",
+            options={"require": ["sub", "jti", "iat", "nbf", "exp", "iss", "aud"]},
+        )
     except jwt.InvalidTokenError:
         raise unauthorized from None
 
-    user = db.get(UserRecord, subject)
-    if user is None or not user.is_active:
+    subject = payload.get("sub")
+    session_id = payload.get("jti")
+    if not isinstance(subject, str) or not subject or not isinstance(session_id, str):
         raise unauthorized
+    session = db.get(UserSessionRecord, session_id)
+    if session is None or session.user_id != subject or session.revoked_at is not None:
+        raise unauthorized
+    expires_at = session.expires_at
+    if expires_at.tzinfo is None:
+        expires_at = expires_at.replace(tzinfo=timezone.utc)
+    if expires_at <= datetime.now(timezone.utc):
+        raise unauthorized
+    user = db.get(UserRecord, subject)
+    if (
+        user is None
+        or not user.is_active
+        or user.tenant_id != session.tenant_id
+    ):
+        raise unauthorized
+    return session
+
+
+def get_current_user(
+    session: UserSessionRecord = Depends(get_current_session),
+    db: Session = Depends(get_db),
+) -> UserRecord:
+    user = db.get(UserRecord, session.user_id)
+    if user is None:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid or expired access token",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
     return user
 
 

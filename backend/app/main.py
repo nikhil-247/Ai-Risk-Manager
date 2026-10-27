@@ -4,28 +4,36 @@ import csv
 import io
 import json
 import os
+import hashlib
+import logging
+import secrets
 from contextlib import asynccontextmanager
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Literal
 from uuid import uuid4
 
-from fastapi import Depends, FastAPI, File, HTTPException, Query, Response, UploadFile, status
+from fastapi import Depends, FastAPI, File, HTTPException, Query, Request, Response, UploadFile, status
 from fastapi.security import OAuth2PasswordRequestForm
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field, ValidationError, field_validator
-from sqlalchemy import desc, func, select
+from sqlalchemy import desc, func, select, update
 from sqlalchemy.orm import Session
 from sqlalchemy.exc import IntegrityError
 
 from backend.app.auth import (
-    ACCESS_TOKEN_MINUTES, bootstrap_admin, create_access_token, get_current_user,
-    hash_password, normalize_email, require_roles, verify_password,
+    ACCESS_TOKEN_MINUTES, bootstrap_admin, create_access_token, get_current_session,
+    get_current_user, hash_password, normalize_email, require_roles, verify_password,
 )
 from backend.app.database import get_db
-from backend.app.models import AuditEvent, RiskPolicyRecord, TenantRecord, TransactionRecord, UserRecord
+from backend.app.models import (
+    AuditEvent, PasswordResetTokenRecord, RiskPolicyRecord, TenantInvitationRecord,
+    TenantRecord, TransactionRecord, UserRecord, UserSessionRecord,
+)
 from backend.app.risk_scoring import ScoreRequest, score_features
 from backend.app.seed import seed_demo_data
+from backend.app.messaging import create_action_url, send_security_email
+from backend.app.security_controls import enforce_rate_limit
 
 
 @asynccontextmanager
@@ -36,6 +44,8 @@ async def lifespan(_: FastAPI):
         seed_demo_data(db)
     yield
 
+
+logger = logging.getLogger("risklens.auth")
 
 app = FastAPI(
     title="RiskLens AI API",
@@ -80,6 +90,35 @@ class RegisterRequest(BaseModel):
 
 class AdminUserCreate(RegisterRequest):
     role: Literal["admin", "analyst", "viewer"] = "viewer"
+
+
+class EmailRequest(BaseModel):
+    email: str = Field(min_length=5, max_length=320)
+
+    @field_validator("email")
+    @classmethod
+    def normalize_and_validate_email(cls, value: str) -> str:
+        normalized = normalize_email(value)
+        if normalized.count("@") != 1 or any(ch.isspace() for ch in normalized):
+            raise ValueError("A valid email address is required")
+        local, domain = normalized.rsplit("@", 1)
+        if not local or "." not in domain or domain.startswith(".") or domain.endswith("."):
+            raise ValueError("A valid email address is required")
+        return normalized
+
+
+class PasswordResetConfirm(BaseModel):
+    token: str = Field(min_length=32, max_length=256)
+    new_password: str = Field(min_length=12, max_length=128)
+
+
+class InvitationCreate(EmailRequest):
+    role: Literal["admin", "analyst", "viewer"] = "viewer"
+
+
+class InvitationAccept(BaseModel):
+    token: str = Field(min_length=32, max_length=256)
+    password: str = Field(min_length=12, max_length=128)
 
 
 class ReviewRequest(BaseModel):
@@ -188,8 +227,9 @@ def _create_user(
 
 
 @app.post("/api/auth/register", status_code=status.HTTP_201_CREATED)
-def register(payload: RegisterRequest, db: Session = Depends(get_db)):
+def register(payload: RegisterRequest, request: Request, db: Session = Depends(get_db)):
     """Create a new isolated workspace whose first member is its administrator."""
+    enforce_rate_limit(request, "register", 5, 3600, identities=[payload.email])
     local_part = payload.email.split("@", 1)[0][:100]
     tenant = TenantRecord(id=str(uuid4()), name=f"{local_part}'s workspace")
     db.add(tenant)
@@ -202,6 +242,7 @@ def register(payload: RegisterRequest, db: Session = Depends(get_db)):
 
 @app.post("/api/auth/login")
 def login(
+    request: Request,
     response: Response,
     form_data: OAuth2PasswordRequestForm = Depends(),
     db: Session = Depends(get_db),
@@ -209,6 +250,7 @@ def login(
     response.headers["Cache-Control"] = "no-store"
     response.headers["Pragma"] = "no-cache"
     email = normalize_email(form_data.username)
+    enforce_rate_limit(request, "login", 12, 900, identities=[email])
     user = db.scalar(select(UserRecord).where(UserRecord.email == email))
     if user is None or not user.is_active or not verify_password(form_data.password, user.password_hash):
         raise HTTPException(
@@ -220,12 +262,96 @@ def login(
                 "Pragma": "no-cache",
             },
         )
+    token = create_access_token(
+        user.id,
+        db,
+        user.tenant_id,
+        ip_address=request.client.host if request.client else None,
+        user_agent=request.headers.get("user-agent"),
+    )
     return {
-        "access_token": create_access_token(user.id),
+        "access_token": token,
         "token_type": "bearer",
         "expires_in": ACCESS_TOKEN_MINUTES * 60,
         "user": _public_user(user, db),
     }
+
+
+@app.post("/api/auth/logout")
+def logout(
+    current_session: UserSessionRecord = Depends(get_current_session),
+    db: Session = Depends(get_db),
+):
+    current_session.revoked_at = datetime.now(timezone.utc)
+    db.commit()
+    return {"status": "signed_out"}
+
+
+@app.post("/api/auth/logout-all")
+def logout_all(
+    current_user: UserRecord = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    now = datetime.now(timezone.utc)
+    result = db.execute(
+        update(UserSessionRecord)
+        .where(
+            UserSessionRecord.user_id == current_user.id,
+            UserSessionRecord.revoked_at.is_(None),
+            UserSessionRecord.expires_at > now,
+        )
+        .values(revoked_at=now)
+        .execution_options(synchronize_session=False)
+    )
+    db.commit()
+    return {"status": "signed_out_all", "revoked_sessions": result.rowcount or 0}
+
+
+@app.get("/api/auth/sessions")
+def list_sessions(
+    current_user: UserRecord = Depends(get_current_user),
+    current_session: UserSessionRecord = Depends(get_current_session),
+    db: Session = Depends(get_db),
+):
+    now = datetime.now(timezone.utc)
+    rows = db.scalars(
+        select(UserSessionRecord)
+        .where(
+            UserSessionRecord.user_id == current_user.id,
+            UserSessionRecord.revoked_at.is_(None),
+            UserSessionRecord.expires_at > now,
+        )
+        .order_by(UserSessionRecord.created_at.desc())
+    ).all()
+    return {"items": [
+        {
+            "id": row.id,
+            "current": row.id == current_session.id,
+            "created_at": row.created_at.isoformat(),
+            "expires_at": row.expires_at.isoformat(),
+            "ip_address": row.ip_address,
+            "user_agent": row.user_agent,
+        }
+        for row in rows
+    ]}
+
+
+@app.post("/api/auth/sessions/{session_id}/revoke")
+def revoke_session(
+    session_id: str,
+    current_user: UserRecord = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    session = db.scalar(select(UserSessionRecord).where(
+        UserSessionRecord.id == session_id,
+        UserSessionRecord.user_id == current_user.id,
+        UserSessionRecord.tenant_id == current_user.tenant_id,
+    ))
+    if session is None or session.revoked_at is not None:
+        raise HTTPException(status_code=404, detail="Session not found")
+    session.revoked_at = datetime.now(timezone.utc)
+    db.commit()
+    return {"status": "session_revoked"}
 
 
 @app.get("/api/auth/me")
@@ -245,6 +371,238 @@ def create_user_as_admin(
         role=payload.role,
         created_by=current_user.email,
     )
+    return _public_user(user, db)
+
+
+@app.post("/api/auth/password-reset/request", status_code=status.HTTP_202_ACCEPTED)
+def request_password_reset(
+    payload: EmailRequest,
+    request: Request,
+    db: Session = Depends(get_db),
+):
+    enforce_rate_limit(request, "password_reset", 5, 3600, identities=[payload.email])
+    # The same response is returned whether the account exists or not.
+    generic = {
+        "message": "If an active account matches that email, password-reset instructions will be sent."
+    }
+    user = db.scalar(select(UserRecord).where(UserRecord.email == payload.email))
+    if user is None or not user.is_active:
+        return generic
+
+    now = datetime.now(timezone.utc)
+    db.execute(
+        update(PasswordResetTokenRecord)
+        .where(
+            PasswordResetTokenRecord.user_id == user.id,
+            PasswordResetTokenRecord.used_at.is_(None),
+        )
+        .values(used_at=now)
+    )
+    raw_token = secrets.token_urlsafe(32)
+    token_hash = hashlib.sha256(raw_token.encode("utf-8")).hexdigest()
+    reset = PasswordResetTokenRecord(
+        token_hash=token_hash,
+        user_id=user.id,
+        tenant_id=user.tenant_id,
+        created_at=now,
+        expires_at=now + timedelta(minutes=30),
+    )
+    db.add(reset)
+    db.commit()
+    reset_url = create_action_url("reset_token", raw_token)
+    try:
+        send_security_email(
+            user.email,
+            "Reset your RiskLens AI password",
+            "A password reset was requested for your RiskLens AI account. "
+            "Use this one-time link within 30 minutes:\n\n"
+            f"{reset_url}\n\n"
+            "If you did not request this, you can ignore this email.",
+        )
+    except Exception:
+        logger.exception("Password-reset email delivery failed")
+        reset.used_at = datetime.now(timezone.utc)
+        db.commit()
+        return generic
+    return generic
+
+
+@app.post("/api/auth/password-reset/confirm")
+def confirm_password_reset(
+    payload: PasswordResetConfirm,
+    request: Request,
+    db: Session = Depends(get_db),
+):
+    enforce_rate_limit(request, "password_reset_confirm", 10, 900)
+    token_hash = hashlib.sha256(payload.token.encode("utf-8")).hexdigest()
+    now = datetime.now(timezone.utc)
+    consumed = db.execute(
+        update(PasswordResetTokenRecord)
+        .where(
+            PasswordResetTokenRecord.token_hash == token_hash,
+            PasswordResetTokenRecord.used_at.is_(None),
+            PasswordResetTokenRecord.expires_at > now,
+        )
+        .values(used_at=now)
+        .execution_options(synchronize_session=False)
+    )
+    if consumed.rowcount != 1:
+        raise HTTPException(status_code=400, detail="Reset link is invalid or expired")
+    reset = db.get(PasswordResetTokenRecord, token_hash)
+    if reset is None:
+        raise HTTPException(status_code=400, detail="Reset link is invalid or expired")
+    user = db.get(UserRecord, reset.user_id)
+    if user is None or not user.is_active or user.tenant_id != reset.tenant_id:
+        raise HTTPException(status_code=400, detail="Reset link is invalid or expired")
+
+    user.password_hash = hash_password(payload.new_password)
+    db.execute(
+        update(PasswordResetTokenRecord)
+        .where(
+            PasswordResetTokenRecord.user_id == user.id,
+            PasswordResetTokenRecord.token_hash != token_hash,
+            PasswordResetTokenRecord.used_at.is_(None),
+        )
+        .values(used_at=now)
+        .execution_options(synchronize_session=False)
+    )
+    db.execute(
+        update(UserSessionRecord)
+        .where(
+            UserSessionRecord.user_id == user.id,
+            UserSessionRecord.revoked_at.is_(None),
+        )
+        .values(revoked_at=now)
+    )
+    add_audit(
+        db, user.tenant_id, "password_reset", f"user:{user.id}", user.email,
+        {"user_id": user.id, "method": "one_time_email_token"},
+    )
+    db.commit()
+    return {"status": "password_updated", "message": "Password updated. Please sign in again."}
+
+
+@app.post("/api/auth/invitations", status_code=status.HTTP_201_CREATED)
+def create_invitation(
+    payload: InvitationCreate,
+    request: Request,
+    current_user: UserRecord = Depends(require_roles("admin")),
+    db: Session = Depends(get_db),
+):
+    enforce_rate_limit(
+        request, "invitation_create", 20, 3600,
+        identities=[current_user.tenant_id, payload.email],
+    )
+    existing_user = db.scalar(select(UserRecord).where(UserRecord.email == payload.email))
+    if existing_user is not None:
+        raise HTTPException(status_code=409, detail="This email already has a RiskLens AI account")
+
+    now = datetime.now(timezone.utc)
+    db.execute(
+        update(TenantInvitationRecord)
+        .where(
+            TenantInvitationRecord.tenant_id == current_user.tenant_id,
+            TenantInvitationRecord.invited_email == payload.email,
+            TenantInvitationRecord.accepted_at.is_(None),
+            TenantInvitationRecord.expires_at > now,
+        )
+        .values(expires_at=now)
+    )
+    raw_token = secrets.token_urlsafe(32)
+    invitation = TenantInvitationRecord(
+        id=str(uuid4()),
+        tenant_id=current_user.tenant_id,
+        invited_email=payload.email,
+        role=payload.role,
+        token_hash=hashlib.sha256(raw_token.encode("utf-8")).hexdigest(),
+        invited_by_user_id=current_user.id,
+        created_at=now,
+        expires_at=now + timedelta(hours=72),
+    )
+    db.add(invitation)
+    add_audit(
+        db, current_user.tenant_id, "invitation_created", f"invitation:{invitation.id}",
+        current_user.email,
+        {"email": payload.email, "role": payload.role, "expires_at": invitation.expires_at.isoformat()},
+    )
+    db.commit()
+    invite_url = create_action_url("invite_token", raw_token)
+    tenant = db.get(TenantRecord, current_user.tenant_id)
+    workspace_name = tenant.name if tenant is not None else "your workspace"
+    try:
+        send_security_email(
+            payload.email,
+            "You're invited to RiskLens AI",
+            f"{current_user.email} invited you to join {workspace_name} "
+            f"as {payload.role}. Accept within 72 hours using this one-time link:\n\n{invite_url}",
+        )
+    except Exception:
+        logger.exception("Workspace invitation email delivery failed")
+        invitation.expires_at = datetime.now(timezone.utc)
+        db.commit()
+        raise HTTPException(status_code=502, detail="Invitation email could not be delivered") from None
+
+    result = {
+        "id": invitation.id,
+        "email": invitation.invited_email,
+        "role": invitation.role,
+        "expires_at": invitation.expires_at.isoformat(),
+        "status": "invitation_created",
+    }
+    if os.getenv("RISKLENS_ENV", "development").strip().lower() != "production":
+        result["invite_url"] = invite_url
+    return result
+
+
+@app.post("/api/auth/invitations/accept", status_code=status.HTTP_201_CREATED)
+def accept_invitation(
+    payload: InvitationAccept,
+    request: Request,
+    db: Session = Depends(get_db),
+):
+    enforce_rate_limit(request, "invitation_accept", 10, 900)
+    token_hash = hashlib.sha256(payload.token.encode("utf-8")).hexdigest()
+    now = datetime.now(timezone.utc)
+    consumed = db.execute(
+        update(TenantInvitationRecord)
+        .where(
+            TenantInvitationRecord.token_hash == token_hash,
+            TenantInvitationRecord.accepted_at.is_(None),
+            TenantInvitationRecord.expires_at > now,
+        )
+        .values(accepted_at=now)
+        .execution_options(synchronize_session=False)
+    )
+    if consumed.rowcount != 1:
+        raise HTTPException(status_code=400, detail="Invitation is invalid or expired")
+    invitation = db.scalar(
+        select(TenantInvitationRecord).where(TenantInvitationRecord.token_hash == token_hash)
+    )
+    if invitation is None:
+        raise HTTPException(status_code=400, detail="Invitation is invalid or expired")
+    if db.scalar(select(UserRecord.id).where(UserRecord.email == invitation.invited_email)):
+        raise HTTPException(status_code=409, detail="This email already has an account")
+
+    user = UserRecord(
+        id=str(uuid4()),
+        tenant_id=invitation.tenant_id,
+        email=invitation.invited_email,
+        password_hash=hash_password(payload.password),
+        role=invitation.role,
+        is_active=True,
+    )
+    db.add(user)
+    add_audit(
+        db, invitation.tenant_id, "invitation_accepted", f"invitation:{invitation.id}",
+        invitation.invited_email,
+        {"user_id": user.id, "email": user.email, "role": user.role},
+    )
+    try:
+        db.commit()
+    except IntegrityError:
+        db.rollback()
+        raise HTTPException(status_code=409, detail="This invitation has already been used") from None
+    db.refresh(user)
     return _public_user(user, db)
 
 
