@@ -2,7 +2,7 @@ import { useEffect, useMemo, useState } from "react";
 import React from "react";
 import {
   Activity, AlertOctagon, ArrowUpRight, Bell, BrainCircuit, Check, ChevronDown,
-  CircleHelp, Clock3, Copy, Download, FileSearch, Filter, Gauge, LayoutDashboard, LogOut,
+  CircleHelp, Clock3, Copy, Download, FileSearch, Filter, Gauge, KeyRound, LayoutDashboard, LogOut,
   ListFilter, LockKeyhole, Menu, Search, ShieldAlert, ShieldCheck, Users, RefreshCw,
   SlidersHorizontal, Upload, X,
 } from "lucide-react";
