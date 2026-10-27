@@ -3,7 +3,7 @@ import React from "react";
 import {
   Activity, AlertOctagon, ArrowUpRight, Bell, BrainCircuit, Check, ChevronDown,
   CircleHelp, Clock3, Download, FileSearch, Filter, Gauge, LayoutDashboard, LogOut,
-  ListFilter, LockKeyhole, Menu, Search, ShieldAlert, ShieldCheck,
+  ListFilter, LockKeyhole, Menu, Search, ShieldAlert, ShieldCheck, Users, RefreshCw,
   SlidersHorizontal, Upload, X,
 } from "lucide-react";
 import {
@@ -28,7 +28,8 @@ type Evaluation = {
   total_misclassification_cost?: number;
   confusion_matrix: { tp: number; fp: number; fn: number; tn: number }; warning: string;
 };
-type Page = "overview" | "transactions" | "investigations" | "model" | "policies" | "audit";
+type Page = "overview" | "transactions" | "investigations" | "model" | "policies" | "audit" | "team";
+type SessionInfo = { id: string; current: boolean; created_at: string; expires_at: string; ip_address?: string | null; user_agent?: string | null };
 type AuthUser = { id: string; email: string; role: "admin" | "analyst" | "viewer"; is_active: boolean; tenant_name?: string; created_at: string };
 type AuthPayload = { access_token: string; token_type: "bearer"; expires_in: number; user: AuthUser };
 
@@ -61,6 +62,7 @@ const navGroups: { title: string; items: { id: Page; label: string; icon: typeof
     { id: "overview" as const, label: "Overview", icon: LayoutDashboard },
     { id: "transactions" as const, label: "Transactions", icon: Activity },
     { id: "investigations" as const, label: "Investigations", icon: FileSearch, badge: "!" },
+    { id: "team" as const, label: "Team & security", icon: Users },
   ]},
   { title: "INTELLIGENCE", items: [
     { id: "model" as const, label: "Model evaluation", icon: BrainCircuit },
@@ -234,6 +236,13 @@ export default function App() {
   const [policyReview, setPolicyReview] = useState(64);
   const [uploadRows, setUploadRows] = useState<Record<string, unknown>[]>([]);
   const [auditRows, setAuditRows] = useState<Record<string, unknown>[]>([]);
+  const [sessions, setSessions] = useState<SessionInfo[]>([]);
+  const [inviteEmail, setInviteEmail] = useState("");
+  const [inviteRole, setInviteRole] = useState<"admin" | "analyst" | "viewer">("analyst");
+  const [inviteUrl, setInviteUrl] = useState("");
+  const [teamNotice, setTeamNotice] = useState("");
+  const [teamError, setTeamError] = useState("");
+  const [teamBusy, setTeamBusy] = useState(false);
   const [reviewNote, setReviewNote] = useState("");
   const [scoringForm, setScoringForm] = useState({
     amount: "1250", country: "US", cross_border: false,
@@ -358,7 +367,74 @@ export default function App() {
       setAuditRows(result.items);
     } catch (error) { setToast(error instanceof Error ? error.message : "Could not load audit log"); }
   }
+  async function loadSessions() {
+    try {
+      const result = await api<{items: SessionInfo[]}>("/api/auth/sessions");
+      setSessions(result.items);
+    } catch (error) {
+      setTeamError(error instanceof Error ? error.message : "Could not load sessions");
+    }
+  }
+  async function createInvitation(event: React.FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    setTeamBusy(true);
+    setTeamError("");
+    setTeamNotice("");
+    setInviteUrl("");
+    try {
+      const result = await api<{email: string; role: string; expires_at: string; invite_url?: string}>(
+        "/api/auth/invitations",
+        {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ email: inviteEmail, role: inviteRole }),
+        },
+      );
+      setInviteUrl(result.invite_url || "");
+      setTeamNotice(`Invitation created for ${result.email} as ${result.role}. Expires ${dateTime(result.expires_at)}.`);
+      setInviteEmail("");
+      await loadSessions();
+    } catch (error) {
+      setTeamError(error instanceof Error ? error.message : "Could not create invitation");
+    } finally {
+      setTeamBusy(false);
+    }
+  }
+  async function revokeSession(sessionId: string) {
+    setTeamBusy(true);
+    setTeamError("");
+    setTeamNotice("");
+    try {
+      await api(`/api/auth/sessions/${encodeURIComponent(sessionId)}/revoke`, { method: "POST" });
+      setTeamNotice("Session revoked. That session can no longer use its access token.");
+      await loadSessions();
+    } catch (error) {
+      setTeamError(error instanceof Error ? error.message : "Could not revoke session");
+    } finally {
+      setTeamBusy(false);
+    }
+  }
+  function clearLocalSession() {
+    window.localStorage.removeItem("risklens_token");
+    window.localStorage.removeItem("risklens_user");
+    setAuthToken("");
+    setAuthUser(null);
+    setSelected(null);
+    setLoading(false);
+  }
+  async function signOutAllSessions() {
+    setTeamBusy(true);
+    try {
+      await api("/api/auth/logout-all", { method: "POST" });
+      clearLocalSession();
+    } catch (error) {
+      setTeamError(error instanceof Error ? error.message : "Could not revoke sessions");
+    } finally {
+      setTeamBusy(false);
+    }
+  }
   useEffect(() => { if (page === "audit") void loadAudit(); }, [page]);
+  useEffect(() => { if (page === "team") { setTeamError(""); setTeamNotice(""); void loadSessions(); } }, [page]);
   useEffect(() => {
     const handleUnauthorized = () => {
       setAuthToken("");
@@ -388,7 +464,7 @@ export default function App() {
   ];
   const pageTitle = ({
     overview: "Risk overview", transactions: "Transactions", investigations: "Investigations",
-    model: "Model evaluation", policies: "Risk policies", audit: "Audit trail",
+    model: "Model evaluation", policies: "Risk policies", audit: "Audit trail", team: "Team & security",
   } satisfies Record<Page, string>)[page];
 
   if (!authToken || !authUser) return <AuthScreen onAuthenticated={(payload) => {
@@ -418,7 +494,7 @@ export default function App() {
       <div className="sidebar-bottom">
         <div className="model-status"><span className="pulse-dot"/><div><strong>Demo rules engine</strong><small>API connected when online</small></div></div>
         <button className="nav-item" onClick={() => setToast("Demo environment: no real payments are connected.")}><CircleHelp size={17}/><span>Help & documentation</span></button>
-        <div className="profile-row"><div className="profile-avatar">{authUser.email.slice(0, 2).toUpperCase()}</div><div><strong>{authUser.email}</strong><small>{authUser.role} account</small></div><button className="icon-button" title="Sign out" aria-label="Sign out" onClick={() => { window.localStorage.removeItem("risklens_token"); window.localStorage.removeItem("risklens_user"); setAuthToken(""); setAuthUser(null); setSelected(null); }}><LogOut size={16}/></button></div>
+        <div className="profile-row"><div className="profile-avatar">{authUser.email.slice(0, 2).toUpperCase()}</div><div><strong>{authUser.email}</strong><small>{authUser.role} account</small></div><button className="icon-button" title="Sign out" aria-label="Sign out" onClick={() => { void api("/api/auth/logout", { method: "POST" }).catch(() => undefined).finally(clearLocalSession); }}><LogOut size={16}/></button></div>
       </div>
     </aside>
 
