@@ -518,11 +518,13 @@ def create_invitation(
     )
     db.commit()
     invite_url = create_action_url("invite_token", raw_token)
+    tenant = db.get(TenantRecord, current_user.tenant_id)
+    workspace_name = tenant.name if tenant is not None else "your workspace"
     try:
         send_security_email(
             payload.email,
             "You're invited to RiskLens AI",
-            f"{current_user.email} invited you to join the {current_user.tenant_id} workspace "
+            f"{current_user.email} invited you to join {workspace_name} "
             f"as {payload.role}. Accept within 72 hours using this one-time link:\n\n{invite_url}",
         )
     except Exception:
