@@ -2,9 +2,13 @@ import os
 import subprocess
 import sys
 from pathlib import Path
+from urllib.parse import parse_qs, urlparse
+from uuid import uuid4
 
 import pytest
 from fastapi.testclient import TestClient
+from fastapi import HTTPException
+from starlette.requests import Request
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import StaticPool
@@ -15,6 +19,7 @@ from backend.app.models import TenantRecord, UserRecord
 from backend.app.tenancy import DEFAULT_TENANT_ID, DEFAULT_TENANT_NAME
 from backend.app.main import app
 from backend.app.seed import seed_demo_data
+from backend.app.security_controls import enforce_rate_limit
 
 
 @pytest.fixture()
@@ -412,3 +417,149 @@ def test_registered_workspace_cannot_read_or_change_default_tenant_data(client):
     assert default_audit.status_code == 200
     assert default_audit.json()["total"] == 1
     assert default_audit.json()["items"][0]["details"]["email"] == "default.member@example.com"
+
+
+
+def test_session_list_and_single_session_revocation(client):
+    original_token = client.headers["Authorization"].split(" ", 1)[1]
+    db_generator = app.dependency_overrides[get_db]()
+    test_db = next(db_generator)
+    try:
+        second_token = create_access_token("test-admin-id", test_db, DEFAULT_TENANT_ID)
+    finally:
+        db_generator.close()
+
+    sessions = client.get("/api/auth/sessions")
+    assert sessions.status_code == 200
+    assert len(sessions.json()["items"]) == 2
+    target = next(item for item in sessions.json()["items"] if not item["current"])
+    assert client.post(f"/api/auth/sessions/{target['id']}/revoke").status_code == 200
+
+    client.headers.update({"Authorization": f"Bearer {second_token}"})
+    assert client.get("/api/summary").status_code == 401
+    client.headers.update({"Authorization": f"Bearer {original_token}"})
+    assert client.get("/api/summary").status_code == 200
+
+
+def test_logout_all_revokes_every_active_session(client):
+    db_generator = app.dependency_overrides[get_db]()
+    test_db = next(db_generator)
+    try:
+        create_access_token("test-admin-id", test_db, DEFAULT_TENANT_ID)
+    finally:
+        db_generator.close()
+
+    response = client.post("/api/auth/logout-all")
+    assert response.status_code == 200
+    assert response.json()["revoked_sessions"] >= 2
+    assert client.get("/api/summary").status_code == 401
+
+
+def test_password_reset_is_generic_single_use_and_revokes_sessions(client, monkeypatch):
+    sent = {}
+
+    def capture_mail(recipient, subject, body):
+        sent.update(recipient=recipient, subject=subject, body=body)
+
+    monkeypatch.setattr("backend.app.main.send_security_email", capture_mail)
+    old_token = client.headers["Authorization"].split(" ", 1)[1]
+    requested = client.post(
+        "/api/auth/password-reset/request",
+        json={"email": "ADMIN@example.com"},
+    )
+    assert requested.status_code == 202
+    assert "If an active account matches" in requested.json()["message"]
+    assert "token" not in requested.json()
+    assert sent["recipient"] == "admin@example.com"
+
+    reset_url = next(part for part in sent["body"].split() if "reset_token=" in part)
+    reset_token = parse_qs(urlparse(reset_url).query)["reset_token"][0]
+    changed = client.post(
+        "/api/auth/password-reset/confirm",
+        json={"token": reset_token, "new_password": "admin-password-after-reset-123!"},
+    )
+    assert changed.status_code == 200
+    assert client.get("/api/summary").status_code == 401
+
+    old_login = client.post(
+        "/api/auth/login",
+        data={"username": "admin@example.com", "password": "test-admin-password-123!"},
+    )
+    assert old_login.status_code == 401
+    new_login = client.post(
+        "/api/auth/login",
+        data={"username": "admin@example.com", "password": "admin-password-after-reset-123!"},
+    )
+    assert new_login.status_code == 200
+    client.headers.update({"Authorization": f"Bearer {new_login.json()['access_token']}"})
+    assert client.get("/api/summary").status_code == 200
+
+    reused = client.post(
+        "/api/auth/password-reset/confirm",
+        json={"token": reset_token, "new_password": "another-password-after-reset-123!"},
+    )
+    assert reused.status_code == 400
+
+
+def test_workspace_invitation_is_one_time_and_stays_in_tenant(client, monkeypatch):
+    sent = {}
+
+    def capture_mail(recipient, subject, body):
+        sent.update(recipient=recipient, subject=subject, body=body)
+
+    monkeypatch.setattr("backend.app.main.send_security_email", capture_mail)
+    created = client.post(
+        "/api/auth/invitations",
+        json={"email": "new.analyst@example.com", "role": "analyst"},
+    )
+    assert created.status_code == 201
+    assert created.json()["role"] == "analyst"
+    assert sent["recipient"] == "new.analyst@example.com"
+    invite_url = created.json()["invite_url"]
+    invite_token = parse_qs(urlparse(invite_url).query)["invite_token"][0]
+
+    accepted = client.post(
+        "/api/auth/invitations/accept",
+        json={"token": invite_token, "password": "invited-analyst-password-123!"},
+    )
+    assert accepted.status_code == 201
+    assert accepted.json()["role"] == "analyst"
+    assert accepted.json()["tenant_name"] == "Northstar Payments"
+
+    reused = client.post(
+        "/api/auth/invitations/accept",
+        json={"token": invite_token, "password": "invited-analyst-password-123!"},
+    )
+    assert reused.status_code == 400
+
+    invited_login = client.post(
+        "/api/auth/login",
+        data={"username": "new.analyst@example.com", "password": "invited-analyst-password-123!"},
+    )
+    assert invited_login.status_code == 200
+    client.headers.update({"Authorization": f"Bearer {invited_login.json()['access_token']}"})
+    assert client.get("/api/summary").json()["total_transactions"] == 12
+
+
+def test_rate_limiter_returns_429_with_retry_after():
+    scope = {
+        "type": "http",
+        "asgi": {"version": "3.0"},
+        "http_version": "1.1",
+        "method": "POST",
+        "scheme": "http",
+        "path": "/test-rate-limit",
+        "raw_path": b"/test-rate-limit",
+        "query_string": b"",
+        "headers": [],
+        "client": ("192.0.2.50", 54321),
+        "server": ("testserver", 80),
+    }
+    request = Request(scope)
+    bucket = "unit-test-" + uuid4().hex
+    enforce_rate_limit(request, bucket, 2, 60, identities=["test@example.com"])
+    enforce_rate_limit(request, bucket, 2, 60, identities=["test@example.com"])
+    with pytest.raises(HTTPException) as limited:
+        enforce_rate_limit(request, bucket, 2, 60, identities=["test@example.com"])
+    assert limited.value.status_code == 429
+    assert int(limited.value.headers["Retry-After"]) >= 1
