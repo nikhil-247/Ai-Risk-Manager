@@ -215,8 +215,11 @@ function AuthScreen({ onAuthenticated }: { onAuthenticated: (payload: AuthPayloa
 }
 
 export default function App() {
-  const [authToken, setAuthToken] = useState(() => window.localStorage.getItem("risklens_token") || "");
+  const urlParams = new URLSearchParams(window.location.search);
+  const isAuthActionLink = urlParams.has("reset_token") || urlParams.has("invite_token");
+  const [authToken, setAuthToken] = useState(() => isAuthActionLink ? "" : (window.localStorage.getItem("risklens_token") || ""));
   const [authUser, setAuthUser] = useState<AuthUser | null>(() => {
+    if (isAuthActionLink) return null;
     try { return JSON.parse(window.localStorage.getItem("risklens_user") || "null") as AuthUser | null; }
     catch { return null; }
   });
@@ -243,6 +246,12 @@ export default function App() {
   const [teamNotice, setTeamNotice] = useState("");
   const [teamError, setTeamError] = useState("");
   const [teamBusy, setTeamBusy] = useState(false);
+  useEffect(() => {
+    if (isAuthActionLink) {
+      window.localStorage.removeItem("risklens_token");
+      window.localStorage.removeItem("risklens_user");
+    }
+  }, [isAuthActionLink]);
   const [reviewNote, setReviewNote] = useState("");
   const [scoringForm, setScoringForm] = useState({
     amount: "1250", country: "US", cross_border: false,
