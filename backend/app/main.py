@@ -4,28 +4,36 @@ import csv
 import io
 import json
 import os
+import hashlib
+import logging
+import secrets
 from contextlib import asynccontextmanager
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Literal
 from uuid import uuid4
 
-from fastapi import Depends, FastAPI, File, HTTPException, Query, Response, UploadFile, status
+from fastapi import Depends, FastAPI, File, HTTPException, Query, Request, Response, UploadFile, status
 from fastapi.security import OAuth2PasswordRequestForm
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field, ValidationError, field_validator
-from sqlalchemy import desc, func, select
+from sqlalchemy import desc, func, select, update
 from sqlalchemy.orm import Session
 from sqlalchemy.exc import IntegrityError
 
 from backend.app.auth import (
-    ACCESS_TOKEN_MINUTES, bootstrap_admin, create_access_token, get_current_user,
-    hash_password, normalize_email, require_roles, verify_password,
+    ACCESS_TOKEN_MINUTES, bootstrap_admin, create_access_token, get_current_session,
+    get_current_user, hash_password, normalize_email, require_roles, verify_password,
 )
 from backend.app.database import get_db
-from backend.app.models import AuditEvent, RiskPolicyRecord, TenantRecord, TransactionRecord, UserRecord
+from backend.app.models import (
+    AuditEvent, PasswordResetTokenRecord, RiskPolicyRecord, TenantInvitationRecord,
+    TenantRecord, TransactionRecord, UserRecord, UserSessionRecord,
+)
 from backend.app.risk_scoring import ScoreRequest, score_features
 from backend.app.seed import seed_demo_data
+from backend.app.messaging import create_action_url, send_security_email
+from backend.app.security_controls import enforce_rate_limit
 
 
 @asynccontextmanager
@@ -36,6 +44,8 @@ async def lifespan(_: FastAPI):
         seed_demo_data(db)
     yield
 
+
+logger = logging.getLogger("risklens.auth")
 
 app = FastAPI(
     title="RiskLens AI API",
@@ -80,6 +90,35 @@ class RegisterRequest(BaseModel):
 
 class AdminUserCreate(RegisterRequest):
     role: Literal["admin", "analyst", "viewer"] = "viewer"
+
+
+class EmailRequest(BaseModel):
+    email: str = Field(min_length=5, max_length=320)
+
+    @field_validator("email")
+    @classmethod
+    def normalize_and_validate_email(cls, value: str) -> str:
+        normalized = normalize_email(value)
+        if normalized.count("@") != 1 or any(ch.isspace() for ch in normalized):
+            raise ValueError("A valid email address is required")
+        local, domain = normalized.rsplit("@", 1)
+        if not local or "." not in domain or domain.startswith(".") or domain.endswith("."):
+            raise ValueError("A valid email address is required")
+        return normalized
+
+
+class PasswordResetConfirm(BaseModel):
+    token: str = Field(min_length=32, max_length=256)
+    new_password: str = Field(min_length=12, max_length=128)
+
+
+class InvitationCreate(EmailRequest):
+    role: Literal["admin", "analyst", "viewer"] = "viewer"
+
+
+class InvitationAccept(BaseModel):
+    token: str = Field(min_length=32, max_length=256)
+    password: str = Field(min_length=12, max_length=128)
 
 
 class ReviewRequest(BaseModel):
@@ -188,8 +227,9 @@ def _create_user(
 
 
 @app.post("/api/auth/register", status_code=status.HTTP_201_CREATED)
-def register(payload: RegisterRequest, db: Session = Depends(get_db)):
+def register(payload: RegisterRequest, request: Request, db: Session = Depends(get_db)):
     """Create a new isolated workspace whose first member is its administrator."""
+    enforce_rate_limit(request, "register", 5, 3600, identities=[payload.email])
     local_part = payload.email.split("@", 1)[0][:100]
     tenant = TenantRecord(id=str(uuid4()), name=f"{local_part}'s workspace")
     db.add(tenant)
@@ -202,6 +242,7 @@ def register(payload: RegisterRequest, db: Session = Depends(get_db)):
 
 @app.post("/api/auth/login")
 def login(
+    request: Request,
     response: Response,
     form_data: OAuth2PasswordRequestForm = Depends(),
     db: Session = Depends(get_db),
@@ -209,6 +250,7 @@ def login(
     response.headers["Cache-Control"] = "no-store"
     response.headers["Pragma"] = "no-cache"
     email = normalize_email(form_data.username)
+    enforce_rate_limit(request, "login", 12, 900, identities=[email])
     user = db.scalar(select(UserRecord).where(UserRecord.email == email))
     if user is None or not user.is_active or not verify_password(form_data.password, user.password_hash):
         raise HTTPException(
@@ -220,12 +262,95 @@ def login(
                 "Pragma": "no-cache",
             },
         )
+    token = create_access_token(
+        user.id,
+        db,
+        user.tenant_id,
+        ip_address=request.client.host if request.client else None,
+        user_agent=request.headers.get("user-agent"),
+    )
     return {
-        "access_token": create_access_token(user.id),
+        "access_token": token,
         "token_type": "bearer",
         "expires_in": ACCESS_TOKEN_MINUTES * 60,
         "user": _public_user(user, db),
     }
+
+
+@app.post("/api/auth/logout")
+def logout(
+    current_session: UserSessionRecord = Depends(get_current_session),
+    db: Session = Depends(get_db),
+):
+    current_session.revoked_at = datetime.now(timezone.utc)
+    db.commit()
+    return {"status": "signed_out"}
+
+
+@app.post("/api/auth/logout-all")
+def logout_all(
+    current_user: UserRecord = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    now = datetime.now(timezone.utc)
+    result = db.execute(
+        update(UserSessionRecord)
+        .where(
+            UserSessionRecord.user_id == current_user.id,
+            UserSessionRecord.revoked_at.is_(None),
+            UserSessionRecord.expires_at > now,
+        )
+        .values(revoked_at=now)
+    )
+    db.commit()
+    return {"status": "signed_out_all", "revoked_sessions": result.rowcount or 0}
+
+
+@app.get("/api/auth/sessions")
+def list_sessions(
+    current_user: UserRecord = Depends(get_current_user),
+    current_session: UserSessionRecord = Depends(get_current_session),
+    db: Session = Depends(get_db),
+):
+    now = datetime.now(timezone.utc)
+    rows = db.scalars(
+        select(UserSessionRecord)
+        .where(
+            UserSessionRecord.user_id == current_user.id,
+            UserSessionRecord.revoked_at.is_(None),
+            UserSessionRecord.expires_at > now,
+        )
+        .order_by(UserSessionRecord.created_at.desc())
+    ).all()
+    return {"items": [
+        {
+            "id": row.id,
+            "current": row.id == current_session.id,
+            "created_at": row.created_at.isoformat(),
+            "expires_at": row.expires_at.isoformat(),
+            "ip_address": row.ip_address,
+            "user_agent": row.user_agent,
+        }
+        for row in rows
+    ]}
+
+
+@app.post("/api/auth/sessions/{session_id}/revoke")
+def revoke_session(
+    session_id: str,
+    current_user: UserRecord = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    session = db.scalar(select(UserSessionRecord).where(
+        UserSessionRecord.id == session_id,
+        UserSessionRecord.user_id == current_user.id,
+        UserSessionRecord.tenant_id == current_user.tenant_id,
+    ))
+    if session is None or session.revoked_at is not None:
+        raise HTTPException(status_code=404, detail="Session not found")
+    session.revoked_at = datetime.now(timezone.utc)
+    db.commit()
+    return {"status": "session_revoked"}
 
 
 @app.get("/api/auth/me")
